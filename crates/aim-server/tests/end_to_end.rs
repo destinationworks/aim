@@ -1,0 +1,895 @@
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use aim::client::AimClient;
+use aim::config::ResolvedConfig;
+use aim_proto::wire::{AckRequest, ClaimRequest, RegisterRequest, ReleaseRequest, SendRequest};
+use aim_proto::{Performative, PROTOCOL};
+use aim_server::auth::{generate_token, hash_token_hex};
+use aim_server::certs::{init_ca, init_server_cert};
+use aim_server::config::{KeyEntry, ServerConfig};
+use aim_server::serve_with_handle;
+use axum_server::Handle;
+use tempfile::TempDir;
+use url::Url;
+
+struct Harness {
+    _dir: TempDir,
+    base_url: Url,
+    ca_cert: PathBuf,
+    mac_key: PathBuf,
+    wks_key: PathBuf,
+    win_key: PathBuf,
+    wrong_ca: PathBuf,
+    disabled_key: PathBuf,
+    handle: Handle,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.handle.shutdown();
+    }
+}
+
+impl Harness {
+    fn client_for(&self, key_file: &Path) -> AimClient {
+        let cfg = ResolvedConfig {
+            url: self.base_url.clone(),
+            ca_cert: self.ca_cert.clone(),
+            key_file: key_file.to_path_buf(),
+            default_agent: None,
+            caps: vec!["test".into()],
+            timeout_secs: 10,
+        };
+        AimClient::from_config(&cfg).unwrap()
+    }
+}
+
+async fn start_harness() -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let ca_cert = root.join("ca.crt");
+    let ca_key = root.join("ca.key");
+    let srv_cert = root.join("server.crt");
+    let srv_key = root.join("server.key");
+    let wrong_ca = root.join("wrong-ca.crt");
+    let wrong_ca_key = root.join("wrong-ca.key");
+
+    init_ca(&ca_cert, &ca_key, "AIM Test CA", 365, false).unwrap();
+    init_ca(&wrong_ca, &wrong_ca_key, "Wrong CA", 365, false).unwrap();
+    init_server_cert(
+        &ca_cert,
+        &ca_key,
+        &srv_cert,
+        &srv_key,
+        &["127.0.0.1".into(), "localhost".into()],
+        365,
+        false,
+    )
+    .unwrap();
+
+    let mac_tok = generate_token();
+    let wks_tok = generate_token();
+    let win_tok = generate_token();
+    let dis_tok = generate_token();
+
+    let mac_key = root.join("macbook.key");
+    let wks_key = root.join("workstation.key");
+    let win_key = root.join("win-dev.key");
+    let disabled_key = root.join("disabled.key");
+    aim_fs::write_private_atomic(&mac_key, mac_tok.as_bytes(), false).unwrap();
+    aim_fs::write_private_atomic(&wks_key, wks_tok.as_bytes(), false).unwrap();
+    aim_fs::write_private_atomic(&win_key, win_tok.as_bytes(), false).unwrap();
+    aim_fs::write_private_atomic(&disabled_key, dis_tok.as_bytes(), false).unwrap();
+
+    let mut cfg = ServerConfig::defaults_for(root.join("data"), srv_cert, srv_key);
+    cfg.listen = "127.0.0.1:0".into();
+    cfg.base_path = "/aim".into();
+    cfg.keys = vec![
+        KeyEntry {
+            host: "macbook".into(),
+            sha256: hash_token_hex(&mac_tok),
+            enabled: true,
+        },
+        KeyEntry {
+            host: "workstation".into(),
+            sha256: hash_token_hex(&wks_tok),
+            enabled: true,
+        },
+        KeyEntry {
+            host: "win-dev".into(),
+            sha256: hash_token_hex(&win_tok),
+            enabled: true,
+        },
+        KeyEntry {
+            host: "revoked".into(),
+            sha256: hash_token_hex(&dis_tok),
+            enabled: false,
+        },
+    ];
+
+    let handle = Handle::new();
+    let srv_handle = handle.clone();
+    let addr: SocketAddr = cfg.listen_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_with_handle(cfg, addr, srv_handle, None).await;
+    });
+
+    let bound = handle.listening().await.expect("server bound");
+    let base_url = Url::parse(&format!("https://127.0.0.1:{}/aim", bound.port())).unwrap();
+
+    Harness {
+        _dir: dir,
+        base_url,
+        ca_cert,
+        mac_key,
+        wks_key,
+        win_key,
+        wrong_ca,
+        disabled_key,
+        handle,
+    }
+}
+
+#[tokio::test]
+async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
+    let h = start_harness().await;
+    let mac = h.client_for(&h.mac_key);
+    let wks = h.client_for(&h.wks_key);
+    let win = h.client_for(&h.win_key);
+    let revoked = h.client_for(&h.disabled_key);
+
+    // 1. Health works with pinned CA and fails with wrong CA.
+    let health = tokio::task::spawn_blocking({
+        let url = h.base_url.clone();
+        let ca = h.ca_cert.clone();
+        move || AimClient::health_unauth(&url, &ca, 5)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.protocol, PROTOCOL);
+
+    let bad_ca = tokio::task::spawn_blocking({
+        let url = h.base_url.clone();
+        let wrong = h.wrong_ca.clone();
+        move || AimClient::health_unauth(&url, &wrong, 5)
+    })
+    .await
+    .unwrap();
+    assert!(bad_ca.is_err());
+
+    // 2. Disabled/revoked key fails with 401.
+    let unauth = tokio::task::spawn_blocking({
+        let c = revoked.clone();
+        move || c.status()
+    })
+    .await
+    .unwrap();
+    assert!(unauth.unwrap_err().contains("401"));
+
+    // 3. Register agents on different hosts, plus path claims & conflict warning.
+    let r_wks = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        move || {
+            c.register(&RegisterRequest {
+                agent: "agy:s1".into(),
+                repo: Some("example-app".into()),
+                branch: Some("main".into()),
+                head: Some("c0ffee12".into()),
+                caps: vec!["linux".into(), "x86_64".into()],
+                note: Some("building Linux fix".into()),
+                ..Default::default()
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(r_wks.agent, "workstation:agy:s1");
+    assert_eq!(r_wks.host, "workstation");
+
+    let claim1 = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        move || {
+            c.claim(&ClaimRequest {
+                agent: "agy:s1".into(),
+                repo: "example-app".into(),
+                paths: vec!["src/ui/sidebar.rs".into()],
+                ttl_secs: Some(600),
+                note: Some("sidebar alignment".into()),
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(claim1.conflicts.is_empty());
+
+    let r_mac = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || {
+            c.register(&RegisterRequest {
+                agent: "codex:m1".into(),
+                repo: Some("example-app".into()),
+                caps: vec!["macos".into(), "macos-gui".into()],
+                ..Default::default()
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(r_mac.agent, "macbook:codex:m1");
+    // Registering on the same repo surfaces active claims from other computers.
+    assert_eq!(r_mac.conflicts.len(), 1);
+    assert_eq!(r_mac.conflicts[0].agent, "workstation:agy:s1");
+
+    // Overlapping directory claim detects conflict!
+    let claim2 = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || {
+            c.claim(&ClaimRequest {
+                agent: "codex:m1".into(),
+                repo: "example-app".into(),
+                paths: vec!["src/ui".into()],
+                ttl_secs: None,
+                note: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim2.conflicts.len(), 1);
+
+    // 4. Upload Brotli Q6 artifact; before it is shared in a message to macbook,
+    // macbook cannot download it (cross-host artifact isolation), while uploader can.
+    let raw_log = b"=== verification receipt ===\npass: 42\n".repeat(40);
+    let art_info = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        let data = raw_log.clone();
+        move || c.put_artifact("agy:s1", "verify-receipt.log", &data)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(art_info.br_bytes < art_info.raw_bytes);
+
+    let premature_fetch = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let sha = art_info.sha256.clone();
+        move || c.get_artifact(&sha)
+    })
+    .await
+    .unwrap();
+    assert!(premature_fetch.unwrap_err().contains("404"));
+
+    // Secret guard rejects secrets in artifacts too.
+    let bad_art = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        move || {
+            c.put_artifact(
+                "agy:s1",
+                "bad.txt",
+                b"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert!(bad_art.is_err());
+
+    // 5. Cross-computer REQUEST_VERIFY + idempotency + exclusive ACCEPT + RESULT.
+    let req_msg = SendRequest {
+        agent: "agy:s1".into(),
+        to: vec!["cap:macos-gui".into()],
+        performative: Performative::RequestVerify,
+        thread: None,
+        reply_to: None,
+        body: "Verify settings row on macOS for commit c0ffee12".into(),
+        payload: Some(serde_json::json!({ "artifact": art_info.sha256 })),
+        idempotency_key: Some("step-verify-1".into()),
+        expires_in_secs: None,
+        lease_secs: None,
+    };
+    let sent1 = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        let r = req_msg.clone();
+        move || c.send(&r)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!sent1.duplicate);
+
+    // Now that sent1 references art_info.sha256 to cap:macos-gui, macbook CAN download it,
+    // while unaddressed host win-dev still gets 404!
+    let fetched = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let sha = art_info.sha256.clone();
+        move || c.get_artifact(&sha)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fetched, raw_log);
+
+    let win_art_fetch = tokio::task::spawn_blocking({
+        let c = win.clone();
+        let sha = art_info.sha256.clone();
+        move || c.get_artifact(&sha)
+    })
+    .await
+    .unwrap();
+    assert!(win_art_fetch.unwrap_err().contains("404"));
+
+    // Self-authorization attempt: win-dev sends a message to itself mentioning art_info.sha256,
+    // and STILL cannot download workstation's artifact (must return 404).
+    tokio::task::spawn_blocking({
+        let c = win.clone();
+        let sha = art_info.sha256.clone();
+        move || {
+            c.send(&SendRequest {
+                agent: "claude:w1".into(),
+                to: vec!["host:win-dev".into()],
+                performative: Performative::Announce,
+                thread: None,
+                reply_to: None,
+                body: format!("Trying to self-authorize artifact {sha}"),
+                payload: Some(serde_json::json!({ "artifact": sha })),
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let win_self_auth_fetch = tokio::task::spawn_blocking({
+        let c = win.clone();
+        let sha = art_info.sha256.clone();
+        move || c.get_artifact(&sha)
+    })
+    .await
+    .unwrap();
+    assert!(win_self_auth_fetch.unwrap_err().contains("404"));
+
+    // win-dev also cannot view the workstation <-> macbook thread or reply to it!
+    let win_thread = tokio::task::spawn_blocking({
+        let c = win.clone();
+        let t = sent1.thread.clone();
+        move || c.thread(&t)
+    })
+    .await
+    .unwrap();
+    assert!(win_thread.unwrap_err().contains("404"));
+
+    let win_reply = tokio::task::spawn_blocking({
+        let c = win.clone();
+        let seq = sent1.seq;
+        move || {
+            c.send(&SendRequest {
+                agent: "claude:w1".into(),
+                to: vec!["workstation:agy:s1".into()],
+                performative: Performative::Accept,
+                thread: None,
+                reply_to: Some(seq),
+                body: "Trying to hijack from another host".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(win_reply.unwrap_err().contains("404"));
+
+    // Thread injection check: root message (reply_to: None) into existing thread fails with 409.
+    let thread_inject = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        let t = sent1.thread.clone();
+        move || {
+            c.send(&SendRequest {
+                agent: "agy:s1".into(),
+                to: vec!["*".into()],
+                performative: Performative::Announce,
+                thread: Some(t),
+                reply_to: None,
+                body: "Injected root message".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(thread_inject.unwrap_err().contains("409"));
+
+    let sent_dup = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        move || c.send(&req_msg)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(sent_dup.duplicate);
+    assert_eq!(sent_dup.seq, sent1.seq);
+
+    // Sender does not receive its own broadcast if it checks inbox, while cap:macos-gui receives it.
+    let mac_inbox = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || c.inbox("codex:m1", None, None, None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(mac_inbox.messages.len(), 1);
+    assert_eq!(mac_inbox.messages[0].seq, sent1.seq);
+    assert_eq!(mac_inbox.read_position, 0);
+
+    // Ack advances hub-stored read_position; next inbox without `after` returns empty.
+    let acked = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let next = mac_inbox.next_after;
+        move || {
+            c.ack(&AckRequest {
+                agent: "codex:m1".into(),
+                read_to: next,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(acked.read_position, mac_inbox.next_after);
+
+    let mac_inbox_2 = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || c.inbox("codex:m1", None, None, None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(mac_inbox_2.messages.is_empty());
+    assert_eq!(mac_inbox_2.read_position, mac_inbox.next_after);
+
+    // Exclusive ACCEPT: macbook:codex:m1 accepts; second agent macbook:claude:m2 gets 409 Conflict.
+    let accept_ok = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let seq = sent1.seq;
+        move || {
+            c.send(&SendRequest {
+                agent: "codex:m1".into(),
+                to: vec!["workstation:agy:s1".into()],
+                performative: Performative::Accept,
+                thread: None,
+                reply_to: Some(seq),
+                body: "Starting isolated macOS QA".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: Some(300),
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!accept_ok.duplicate);
+
+    let accept_race = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let seq = sent1.seq;
+        move || {
+            c.send(&SendRequest {
+                agent: "claude:m2".into(),
+                to: vec!["workstation:agy:s1".into()],
+                performative: Performative::Accept,
+                thread: None,
+                reply_to: Some(seq),
+                body: "I want to take it too".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(accept_race.unwrap_err().contains("409"));
+
+    // 6. Long-poll wakeup test: workstation waits on inbox while macbook sends RESULT.
+    let wks_wait_task = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        let after = accept_ok.seq;
+        move || {
+            let t0 = Instant::now();
+            let res = c
+                .inbox("agy:s1", Some(after), Some(5), None, None, false)
+                .unwrap();
+            (t0.elapsed(), res)
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let res_sent = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let seq = sent1.seq;
+        move || {
+            c.send(&SendRequest {
+                agent: "codex:m1".into(),
+                to: vec!["workstation:agy:s1".into()],
+                performative: Performative::Result,
+                thread: None,
+                reply_to: Some(seq),
+                body: "macOS settings check PASS".into(),
+                payload: Some(serde_json::json!({"ok": true})),
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (elapsed, woken) = wks_wait_task.await.unwrap();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "long-poll took too long: {elapsed:?}"
+    );
+    assert_eq!(woken.messages.len(), 1);
+    assert_eq!(woken.messages[0].seq, res_sent.seq);
+    assert_eq!(woken.messages[0].performative, Performative::Result);
+
+    // Replying with REPLY to RESULT is rejected (anti-loop rule).
+    let loop_reply = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        let rseq = res_sent.seq;
+        move || {
+            c.send(&SendRequest {
+                agent: "agy:s1".into(),
+                to: vec!["macbook:codex:m1".into()],
+                performative: Performative::Reply,
+                thread: None,
+                reply_to: Some(rseq),
+                body: "Thanks!".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(loop_reply.is_err());
+
+    // Replying with QUERY to the now-closed request also fails with 409 Conflict.
+    let closed_query = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        let req_seq = sent1.seq;
+        move || {
+            c.send(&SendRequest {
+                agent: "codex:m1".into(),
+                to: vec!["workstation:agy:s1".into()],
+                performative: Performative::Query,
+                thread: None,
+                reply_to: Some(req_seq),
+                body: "Follow-up question on closed request".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(closed_query.unwrap_err().contains("409"));
+
+    // Thread inspection + release + status.
+    let thr = tokio::task::spawn_blocking({
+        let c = wks.clone();
+        let t = sent1.thread.clone();
+        move || c.thread(&t)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(thr.closed);
+    assert!(thr.accept_expires_ms.is_none());
+    assert!(!thr.notice.is_empty());
+    assert_eq!(thr.messages.len(), 3);
+
+    tokio::task::spawn_blocking({
+        let c = wks.clone();
+        move || {
+            c.release(&ReleaseRequest {
+                agent: "agy:s1".into(),
+                claim_id: None,
+                repo: Some("example-app".into()),
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let status = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || c.status()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.host, "macbook");
+    assert!(!status.notice.is_empty());
+    assert!(status.open_requests.is_empty());
+    assert!(status
+        .agents
+        .iter()
+        .any(|a| a.id == "workstation:agy:s1" && a.live));
+    assert!(status
+        .agents
+        .iter()
+        .any(|a| a.id == "macbook:codex:m1" && a.live));
+}
+
+fn aim_binary() -> PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let srv_bin = PathBuf::from(env!("CARGO_BIN_EXE_aim-server"));
+        let aim_bin = srv_bin.with_file_name(if cfg!(windows) { "aim.exe" } else { "aim" });
+        if !aim_bin.exists() {
+            let status = Command::new(env!("CARGO"))
+                .args(["build", "-p", "aim", "--bin", "aim", "--locked"])
+                .status()
+                .expect("failed invoking cargo build --bin aim");
+            assert!(status.success(), "cargo build --bin aim failed");
+        }
+        assert!(
+            aim_bin.exists(),
+            "expected built aim binary at {}",
+            aim_bin.display()
+        );
+        aim_bin
+    })
+    .clone()
+}
+
+#[tokio::test]
+async fn mcp_stdio_roundtrip_against_live_tls_hub() {
+    let h = start_harness().await;
+    let aim_bin = aim_binary();
+
+    let res = tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(&aim_bin)
+            .arg("mcp")
+            .env("AIM_URL", h.base_url.as_str())
+            .env("AIM_CA_CERT", &h.ca_cert)
+            .env("AIM_KEY_FILE", &h.mac_key)
+            .env("AIM_AGENT", "claude:mcp-1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"aim_register","arguments":{{"note":"via mcp"}}}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"aim_status","arguments":{{}}}}}}"#).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let mut lines: Vec<serde_json::Value> = res
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4);
+    lines.sort_by_key(|v| v["id"].as_i64().unwrap_or(0));
+    assert_eq!(lines[0]["id"], 1);
+    assert_eq!(lines[0]["result"]["serverInfo"]["name"], "aim");
+    assert_eq!(lines[1]["id"], 2);
+    assert!(lines[1]["result"]["tools"].as_array().unwrap().len() >= 8);
+    assert_eq!(lines[2]["id"], 3);
+    assert_eq!(lines[2]["result"]["isError"], false);
+    assert!(lines[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("macbook:claude:mcp-1"));
+    assert_eq!(lines[3]["id"], 4);
+    assert_eq!(lines[3]["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn cli_binaries_init_ca_cert_keygen_revoke_and_send_attach() {
+    let h = start_harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let srv_bin = PathBuf::from(env!("CARGO_BIN_EXE_aim-server"));
+    let aim_bin = aim_binary();
+
+    let base_url = h.base_url.to_string();
+    let test_ca_cert = h.ca_cert.clone();
+    let test_wks_key = h.wks_key.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Exercise aim-server CLI commands: init-ca, init-cert, init-config, keygen, list-keys, revoke.
+        let ca_crt = root.join("ca.crt");
+        let ca_key = root.join("ca.key");
+        let srv_crt = root.join("srv.crt");
+        let srv_key = root.join("srv.key");
+        let srv_cfg = root.join("server.toml");
+        let host_key = root.join("workstation.key");
+
+        let run_srv = |args: &[String]| {
+            let out = Command::new(&srv_bin).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "aim-server {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        run_srv(&[
+            "init-ca".into(),
+            "--ca-cert".into(),
+            ca_crt.display().to_string(),
+            "--ca-key".into(),
+            ca_key.display().to_string(),
+        ]);
+        run_srv(&[
+            "init-cert".into(),
+            "--ca-cert".into(),
+            ca_crt.display().to_string(),
+            "--ca-key".into(),
+            ca_key.display().to_string(),
+            "--cert".into(),
+            srv_crt.display().to_string(),
+            "--key".into(),
+            srv_key.display().to_string(),
+            "--san".into(),
+            "aim.example.internal".into(),
+            "--san".into(),
+            "10.0.0.10".into(),
+        ]);
+        run_srv(&[
+            "init-config".into(),
+            "--config".into(),
+            srv_cfg.display().to_string(),
+            "--data-dir".into(),
+            root.join("data").display().to_string(),
+            "--tls-cert".into(),
+            srv_crt.display().to_string(),
+            "--tls-key".into(),
+            srv_key.display().to_string(),
+        ]);
+        run_srv(&[
+            "keygen".into(),
+            "--config".into(),
+            srv_cfg.display().to_string(),
+            "--host".into(),
+            "workstation".into(),
+            "--out-key".into(),
+            host_key.display().to_string(),
+        ]);
+        let listed = run_srv(&[
+            "list-keys".into(),
+            "--config".into(),
+            srv_cfg.display().to_string(),
+        ]);
+        assert!(listed.contains("workstation"));
+        let revoked = run_srv(&[
+            "revoke".into(),
+            "--config".into(),
+            srv_cfg.display().to_string(),
+            "--host".into(),
+            "workstation".into(),
+        ]);
+        assert!(revoked.contains("\"revoked\":1"));
+
+        // Exercise `aim init` + `aim health` + `aim register` + `aim send --attach` + `aim thread` + `aim artifact get`.
+        let client_cfg = root.join("client.toml");
+        let evidence_file = root.join("evidence.log");
+        std::fs::write(&evidence_file, b"check passed\n".repeat(30)).unwrap();
+
+        let run_aim = |args: &[String]| {
+            let out = Command::new(&aim_bin)
+                .env("AIM_CONFIG", &client_cfg)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "aim {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        run_aim(&[
+            "init".into(),
+            "--url".into(),
+            base_url,
+            "--ca-cert".into(),
+            test_ca_cert.display().to_string(),
+            "--key-file".into(),
+            test_wks_key.display().to_string(),
+        ]);
+        let health_out = run_aim(&["health".into()]);
+        assert!(health_out.contains("\"aim/v1\""));
+
+        run_aim(&[
+            "--agent".into(),
+            "agy:cli1".into(),
+            "register".into(),
+            "--repo".into(),
+            "aim".into(),
+        ]);
+        let sent_out = run_aim(&[
+            "--agent".into(),
+            "agy:cli1".into(),
+            "send".into(),
+            "--to".into(),
+            "host:macbook".into(),
+            "--performative".into(),
+            "ANNOUNCE".into(),
+            "--attach".into(),
+            evidence_file.display().to_string(),
+            "--message".into(),
+            "CLI test complete".into(),
+        ]);
+        let sent_json: serde_json::Value = serde_json::from_str(&sent_out).unwrap();
+        let thr = sent_json["thread"].as_str().unwrap().to_string();
+
+        let thr_out = run_aim(&["thread".into(), thr]);
+        let thr_json: serde_json::Value = serde_json::from_str(&thr_out).unwrap();
+        let art_sha = thr_json["messages"][0]["payload"]["artifacts"][0]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let restored = root.join("restored.log");
+        run_aim(&[
+            "artifact".into(),
+            "get".into(),
+            art_sha,
+            "--out".into(),
+            restored.display().to_string(),
+        ]);
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            std::fs::read(&evidence_file).unwrap()
+        );
+    })
+    .await
+    .unwrap();
+}

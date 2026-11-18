@@ -1,0 +1,673 @@
+use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use aim_proto::names::check_name;
+use aim_proto::wire::{AckRequest, ClaimRequest, RegisterRequest, ReleaseRequest, SendRequest};
+use aim_proto::{Performative, UNTRUSTED_NOTICE};
+use serde_json::{json, Value};
+
+use crate::client::AimClient;
+use crate::config::{default_os_caps, detect_git_context, ResolvedConfig};
+
+const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
+const MAX_CONCURRENT_TOOL_CALLS: usize = 16;
+const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26"];
+
+enum ReadLine {
+    Line(String),
+    TooLong,
+    Eof,
+}
+
+fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<ReadLine> {
+    let mut buf = Vec::new();
+    let mut over_limit = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if buf.is_empty() && !over_limit {
+                return Ok(ReadLine::Eof);
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if !over_limit {
+                if buf.len().saturating_add(pos) <= MAX_MCP_LINE_BYTES {
+                    buf.extend_from_slice(&available[..pos]);
+                } else {
+                    over_limit = true;
+                }
+            }
+            reader.consume(pos + 1);
+            break;
+        } else {
+            let len = available.len();
+            if !over_limit {
+                if buf.len().saturating_add(len) <= MAX_MCP_LINE_BYTES {
+                    buf.extend_from_slice(available);
+                } else {
+                    over_limit = true;
+                    buf.clear();
+                }
+            }
+            reader.consume(len);
+        }
+    }
+    if over_limit {
+        return Ok(ReadLine::TooLong);
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(ReadLine::Line(text))
+}
+
+pub fn run(cfg: &ResolvedConfig) -> Result<i32, String> {
+    let client = AimClient::from_config(cfg)?;
+    let tools = Arc::new(tool_definitions());
+    let cfg = Arc::new(cfg.clone());
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+    let active_workers = Arc::new(AtomicUsize::new(0));
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+
+    loop {
+        let line = match read_bounded_line(&mut reader) {
+            Ok(ReadLine::Eof) => break,
+            Ok(ReadLine::TooLong) => {
+                write_reply(
+                    &stdout,
+                    Value::Null,
+                    Err((-32600, "JSON-RPC line exceeds 256 KiB limit".into())),
+                )?;
+                continue;
+            }
+            Ok(ReadLine::Line(l)) => l,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                write_reply(
+                    &stdout,
+                    Value::Null,
+                    Err((-32700, "JSON-RPC line is not valid UTF-8".into())),
+                )?;
+                continue;
+            }
+            Err(_) => break,
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let req: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                write_reply(
+                    &stdout,
+                    Value::Null,
+                    Err((-32700, format!("JSON parse error: {e}"))),
+                )?;
+                continue;
+            }
+        };
+        let Some(obj) = req.as_object() else {
+            write_reply(
+                &stdout,
+                Value::Null,
+                Err((-32600, "JSON-RPC request must be an object".into())),
+            )?;
+            continue;
+        };
+
+        if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            let err_id = obj
+                .get("id")
+                .filter(|v| v.is_string() || v.is_number() || v.is_null())
+                .cloned()
+                .unwrap_or(Value::Null);
+            write_reply(
+                &stdout,
+                err_id,
+                Err((-32600, "jsonrpc field must be \"2.0\"".into())),
+            )?;
+            continue;
+        }
+
+        // Notifications have no `id` and expect no reply.
+        let Some(id) = obj.get("id").cloned() else {
+            continue;
+        };
+        if !(id.is_string() || id.is_number() || id.is_null()) {
+            write_reply(
+                &stdout,
+                Value::Null,
+                Err((
+                    -32600,
+                    "JSON-RPC id must be a string, number, or null".into(),
+                )),
+            )?;
+            continue;
+        }
+
+        let Some(method) = obj.get("method").and_then(Value::as_str) else {
+            write_reply(&stdout, id, Err((-32600, "missing method".into())))?;
+            continue;
+        };
+
+        if method == "tools/call" {
+            let Some(params) = obj.get("params").and_then(Value::as_object) else {
+                write_reply(&stdout, id, Err((-32602, "missing params".into())))?;
+                continue;
+            };
+            let Some(tool_name) = params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                write_reply(&stdout, id, Err((-32602, "missing tool name".into())))?;
+                continue;
+            };
+            let args = match params.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(v) if v.is_object() => v.clone(),
+                Some(_) => {
+                    write_reply(
+                        &stdout,
+                        id,
+                        Err((-32602, "tool arguments must be a JSON object".into())),
+                    )?;
+                    continue;
+                }
+            };
+
+            // Reap finished thread handles periodically.
+            handles.retain(|h| !h.is_finished());
+
+            if active_workers.load(Ordering::Relaxed) >= MAX_CONCURRENT_TOOL_CALLS {
+                let res = dispatch_tool(&cfg, &client, &tool_name, &args);
+                write_reply(&stdout, id, Ok(res))?;
+            } else {
+                active_workers.fetch_add(1, Ordering::Relaxed);
+                let cfg_c = cfg.clone();
+                let client_c = client.clone();
+                let out_c = stdout.clone();
+                let workers_c = active_workers.clone();
+                handles.push(thread::spawn(move || {
+                    let res = dispatch_tool(&cfg_c, &client_c, &tool_name, &args);
+                    let _ = write_reply(&out_c, id, Ok(res));
+                    workers_c.fetch_sub(1, Ordering::Relaxed);
+                }));
+            }
+            continue;
+        }
+
+        let resp = handle_sync_rpc(method, obj.get("params"), &tools);
+        write_reply(&stdout, id, resp)?;
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+    Ok(0)
+}
+
+fn write_reply(
+    out: &Arc<Mutex<io::Stdout>>,
+    id: Value,
+    res: Result<Value, (i64, String)>,
+) -> Result<(), String> {
+    let payload = match res {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err((code, message)) => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+        }
+    };
+    let mut guard = out
+        .lock()
+        .map_err(|_| "stdout mutex poisoned".to_string())?;
+    writeln!(guard, "{payload}").map_err(|e| format!("stdout write failed: {e}"))?;
+    guard
+        .flush()
+        .map_err(|e| format!("stdout flush failed: {e}"))
+}
+
+fn handle_sync_rpc(
+    method: &str,
+    params: Option<&Value>,
+    tools: &[Value],
+) -> Result<Value, (i64, String)> {
+    match method {
+        "initialize" => {
+            let requested = params
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str)
+                .unwrap_or("2024-11-05");
+            let negotiated = if SUPPORTED_PROTOCOLS.contains(&requested) {
+                requested
+            } else {
+                "2024-11-05"
+            };
+            Ok(json!({
+                "protocolVersion": negotiated,
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "aim",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }))
+        }
+        "ping" | "logging/setLevel" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools })),
+        "resources/list" => Ok(json!({ "resources": [] })),
+        "prompts/list" => Ok(json!({ "prompts": [] })),
+        _ => Err((-32601, format!("method not found: {method}"))),
+    }
+}
+
+fn dispatch_tool(cfg: &ResolvedConfig, client: &AimClient, name: &str, args: &Value) -> Value {
+    match execute_tool(cfg, client, name, args) {
+        Ok((notice, value)) => {
+            let json_text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into());
+            let mut content = Vec::new();
+            if let Some(n) = notice {
+                content.push(json!({ "type": "text", "text": n }));
+            }
+            content.push(json!({ "type": "text", "text": json_text }));
+            json!({ "content": content, "isError": false })
+        }
+        Err(err) => json!({
+            "content": [{ "type": "text", "text": err }],
+            "isError": true
+        }),
+    }
+}
+
+fn opt_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+fn opt_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("'{key}' must be a non-negative integer")),
+    }
+}
+
+fn opt_i64(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("'{key}' must be an integer")),
+    }
+}
+
+fn opt_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("'{key}' must be a boolean")),
+    }
+}
+
+fn opt_object(args: &Value, key: &str) -> Result<Option<Value>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) if v.is_object() => Ok(Some(v.clone())),
+        Some(_) => Err(format!("'{key}' must be a JSON object")),
+    }
+}
+
+fn str_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(val) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    if val.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = val
+        .as_array()
+        .ok_or_else(|| format!("'{key}' must be an array of strings"))?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.trim().to_string())
+                .ok_or_else(|| format!("'{key}' entries must be strings"))
+        })
+        .collect()
+}
+
+fn execute_tool(
+    cfg: &ResolvedConfig,
+    client: &AimClient,
+    name: &str,
+    args: &Value,
+) -> Result<(Option<&'static str>, Value), String> {
+    let resolve = |explicit: Option<String>| cfg.resolve_agent(explicit.as_deref());
+
+    match name {
+        "aim_register" => {
+            let agent = resolve(opt_str(args, "agent")?)?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let git = detect_git_context(&cwd);
+            let mut caps = cfg.caps.clone();
+            if caps.is_empty() {
+                caps = default_os_caps();
+            }
+            for extra in str_list(args, "caps")? {
+                if !caps.contains(&extra) {
+                    caps.push(extra);
+                }
+            }
+            let req = RegisterRequest {
+                agent,
+                repo: opt_str(args, "repo")?.or(git.repo),
+                worktree: opt_str(args, "worktree")?.or(git.worktree),
+                branch: opt_str(args, "branch")?.or(git.branch),
+                head: opt_str(args, "head")?.or(git.head),
+                caps,
+                note: opt_str(args, "note")?,
+            };
+            let res = client.register(&req)?;
+            let notice = if res.conflicts.is_empty() {
+                None
+            } else {
+                Some(UNTRUSTED_NOTICE)
+            };
+            Ok((
+                notice,
+                serde_json::to_value(res).map_err(|e| e.to_string())?,
+            ))
+        }
+        "aim_send" => {
+            let agent = resolve(opt_str(args, "agent")?)?;
+            let to = str_list(args, "to")?;
+            let perf_str = opt_str(args, "performative")?.unwrap_or_else(|| "ANNOUNCE".into());
+            let performative = Performative::parse(&perf_str)
+                .ok_or_else(|| format!("unknown performative '{perf_str}'"))?;
+            let body = match args.get("message") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return Err("message is required and must be a string".into()),
+            };
+            let req = SendRequest {
+                agent,
+                to,
+                performative,
+                thread: opt_str(args, "thread")?,
+                reply_to: opt_u64(args, "reply_to")?,
+                body,
+                payload: opt_object(args, "payload")?,
+                idempotency_key: opt_str(args, "idempotency_key")?,
+                expires_in_secs: opt_u64(args, "expires_in_secs")?,
+                lease_secs: opt_u64(args, "lease_secs")?,
+            };
+            let res = client.send(&req)?;
+            Ok((None, serde_json::to_value(res).map_err(|e| e.to_string())?))
+        }
+        "aim_inbox" => {
+            let agent = resolve(opt_str(args, "agent")?)?;
+            let after = opt_u64(args, "after")?;
+            let wait = opt_u64(args, "wait_secs")?;
+            let limit = match opt_u64(args, "limit")? {
+                Some(v) => Some(u32::try_from(v).map_err(|_| "'limit' is out of range")?),
+                None => None,
+            };
+            let thread = opt_str(args, "thread")?;
+            let include_self = opt_bool(args, "include_self")?.unwrap_or(false);
+            let auto_ack = opt_bool(args, "ack")?.unwrap_or(false);
+            if auto_ack && (thread.is_some() || after.is_some()) {
+                return Err(
+                    "ack=true cannot be combined with thread or after (would skip unread messages)"
+                        .into(),
+                );
+            }
+            let mut res =
+                client.inbox(&agent, after, wait, limit, thread.as_deref(), include_self)?;
+            if auto_ack && res.next_after > res.read_position {
+                let acked = client.ack(&AckRequest {
+                    agent,
+                    read_to: res.next_after,
+                })?;
+                res.read_position = acked.read_position;
+            }
+            Ok((
+                Some(UNTRUSTED_NOTICE),
+                serde_json::to_value(res).map_err(|e| e.to_string())?,
+            ))
+        }
+        "aim_ack" => {
+            let agent = resolve(opt_str(args, "agent")?)?;
+            let read_to = opt_u64(args, "read_to")?.ok_or("read_to sequence number is required")?;
+            let res = client.ack(&AckRequest { agent, read_to })?;
+            Ok((None, serde_json::to_value(res).map_err(|e| e.to_string())?))
+        }
+        "aim_claim" => {
+            let agent = resolve(opt_str(args, "agent")?)?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let git = detect_git_context(&cwd);
+            let repo = opt_str(args, "repo")?
+                .or(git.repo)
+                .ok_or("repo is required outside a git checkout")?;
+            let paths = str_list(args, "paths")?;
+            let req = ClaimRequest {
+                agent,
+                repo,
+                paths,
+                ttl_secs: opt_u64(args, "ttl_secs")?,
+                note: opt_str(args, "note")?,
+            };
+            let res = client.claim(&req)?;
+            let notice = if res.conflicts.is_empty() {
+                None
+            } else {
+                Some(UNTRUSTED_NOTICE)
+            };
+            Ok((
+                notice,
+                serde_json::to_value(res).map_err(|e| e.to_string())?,
+            ))
+        }
+        "aim_release" => {
+            let agent = resolve(opt_str(args, "agent")?)?;
+            let req = ReleaseRequest {
+                agent,
+                claim_id: opt_i64(args, "claim_id")?,
+                repo: opt_str(args, "repo")?,
+            };
+            let res = client.release(&req)?;
+            Ok((None, res))
+        }
+        "aim_status" => {
+            let res = client.status()?;
+            Ok((
+                Some(UNTRUSTED_NOTICE),
+                serde_json::to_value(res).map_err(|e| e.to_string())?,
+            ))
+        }
+        "aim_thread" => {
+            let thread = opt_str(args, "thread")?.ok_or("thread is required")?;
+            check_name("thread", &thread)?;
+            let res = client.thread(&thread)?;
+            Ok((
+                Some(UNTRUSTED_NOTICE),
+                serde_json::to_value(res).map_err(|e| e.to_string())?,
+            ))
+        }
+        _ => Err(format!("unknown AIM tool: {name}")),
+    }
+}
+
+fn tool_definitions() -> Vec<Value> {
+    let perf_enum: Vec<&str> = Performative::ALL.iter().map(|p| p.as_str()).collect();
+    vec![
+        json!({
+            "name": "aim_register",
+            "description": "Register or heartbeat this agent on the cross-computer AIM hub, advertising its repo, branch, capabilities, and checking for overlapping path claims.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "HARNESS:SESSION (e.g. agy:session1, codex:session2, claude:session3). Optional when env/config provides it." },
+                    "repo": { "type": "string" },
+                    "worktree": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "head": { "type": "string" },
+                    "caps": { "type": "array", "items": { "type": "string" } },
+                    "note": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_send",
+            "description": "Send a typed message to agents on any computer via AIM. Performatives enforce reply rules (never reply to RESULT; never ACK ANNOUNCE). Secrets are automatically blocked.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "Sender HARNESS:SESSION. Optional when env/config provides it." },
+                    "to": { "type": "array", "items": { "type": "string" }, "description": "Selectors: *, host:NAME, harness:NAME, repo:NAME, cap:NAME, SESSION, or HOST:HARNESS:SESSION" },
+                    "performative": { "type": "string", "enum": perf_enum },
+                    "message": { "type": "string" },
+                    "reply_to": { "type": "integer", "description": "Parent seq when answering a message (required for REPLY, ACCEPT, REJECT, PROGRESS, RESULT)" },
+                    "thread": { "type": "string" },
+                    "payload": { "type": "object" },
+                    "idempotency_key": { "type": "string" },
+                    "expires_in_secs": { "type": "integer" },
+                    "lease_secs": { "type": "integer", "description": "Lease duration for ACCEPT or PROGRESS" }
+                },
+                "required": ["to", "message"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_inbox",
+            "description": "Read AIM messages addressed to this agent across computers. Uses hub-stored read_position if after is omitted. Supports wait_secs (up to 30s) for reactive long-polling.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string" },
+                    "after": { "type": "integer" },
+                    "wait_secs": { "type": "integer" },
+                    "limit": { "type": "integer" },
+                    "thread": { "type": "string" },
+                    "include_self": { "type": "boolean" },
+                    "ack": { "type": "boolean", "description": "Advance hub read_position to next_after if true (cannot be combined with thread or after)" }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_ack",
+            "description": "Advance this agent's hub-stored read position to read_to.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string" },
+                    "read_to": { "type": "integer" }
+                },
+                "required": ["read_to"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_claim",
+            "description": "Claim file or directory patterns in a repo to warn agents on other computers before overlapping edits occur.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "ttl_secs": { "type": "integer" },
+                    "note": { "type": "string" }
+                },
+                "required": ["paths"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_release",
+            "description": "Release one or all file/path claims held by this agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string" },
+                    "claim_id": { "type": "integer" },
+                    "repo": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_status",
+            "description": "Inspect all agents across computers, live path claims, and open cross-machine requests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_thread",
+            "description": "Read every message in a conversation thread and its current lease/closure state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "thread": { "type": "string" }
+                },
+                "required": ["thread"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_extractors_reject_wrong_types() {
+        let args = json!({
+            "claim_id": "not-an-integer",
+            "ack": "true",
+            "payload": [1, 2, 3]
+        });
+        assert!(opt_i64(&args, "claim_id").is_err());
+        assert!(opt_bool(&args, "ack").is_err());
+        assert!(opt_object(&args, "payload").is_err());
+    }
+
+    #[test]
+    fn bounded_line_reader_rejects_oversized_lines() {
+        let big = format!("{}\nshort\n", "a".repeat(MAX_MCP_LINE_BYTES + 10));
+        let mut cursor = io::Cursor::new(big.into_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut cursor).unwrap(),
+            ReadLine::TooLong
+        ));
+        match read_bounded_line(&mut cursor).unwrap() {
+            ReadLine::Line(s) => assert_eq!(s, "short"),
+            _ => panic!("expected next line after draining oversized line"),
+        }
+    }
+}

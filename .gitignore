@@ -1,0 +1,15 @@
+/target
+*.log
+*.key
+*.pem
+*.crt
+*.der
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.lock
+!Cargo.lock
+server.toml
+config.toml
+!deploy/*.example
+.DS_Store
