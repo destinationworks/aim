@@ -49,6 +49,20 @@ fn hash_file_sha256(path: &Path) -> Option<String> {
     Some(out)
 }
 
+fn fallback_exe_sha256(exe_path: Option<&Path>) -> Option<String> {
+    if let Some(hash) = exe_path.and_then(hash_file_sha256) {
+        return Some(hash);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hash_file_sha256(Path::new("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn detect_binary_replaced(
     startup_path: &Path,
     startup_sha256: &str,
@@ -71,16 +85,7 @@ impl McpRuntimeInfo {
             .ok()
             .and_then(|d| u64::try_from(d.as_millis()).ok());
         let exe_path = std::env::current_exe().ok();
-        let binary_sha256 = exe_path.as_deref().and_then(hash_file_sha256).or_else(|| {
-            #[cfg(target_os = "linux")]
-            {
-                hash_file_sha256(Path::new("/proc/self/exe"))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                None
-            }
-        });
+        let binary_sha256 = fallback_exe_sha256(exe_path.as_deref());
         let tool_names = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
