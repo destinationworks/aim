@@ -1,3 +1,4 @@
+pub(crate) mod assignment;
 pub mod auth;
 pub mod certs;
 pub mod config;
@@ -28,9 +29,10 @@ pub fn build_hub_state(cfg: &ServerConfig) -> Result<HubState, String> {
         max_claims_per_host: cfg.max_claims_per_host,
         max_artifacts_total_bytes: cfg.max_artifacts_total_bytes,
         agent_retention_ms: (cfg.agent_retention_secs as i64) * 1000,
+        groups: cfg.groups.clone(),
     };
-    let store = Store::open(&cfg.data_dir, store_cfg)?;
-    let keyring = KeyRing::from_entries(&cfg.keys)?;
+    let keyring = KeyRing::from_config(&cfg.keys, &cfg.groups)?;
+    let store = Store::open_with_keyring(&cfg.data_dir, store_cfg, keyring.clone())?;
     let limiter = AuthRateLimiter::new(cfg.auth_failures_per_minute);
     let auth = AuthState { keyring, limiter };
     let (seq_watch, _) = watch::channel(0u64);
@@ -128,13 +130,18 @@ pub async fn serve_with_handle(
             if let Ok(mut sighup) = signal(SignalKind::hangup()) {
                 while sighup.recv().await.is_some() {
                     match ServerConfig::load(&cfg_path) {
-                        Ok(new_cfg) => match keyring.reload(&new_cfg.keys) {
-                            Ok(n) => eprintln!(
-                                "aim-server: SIGHUP: reloaded {n} keys from {}",
-                                cfg_path.display()
-                            ),
-                            Err(e) => eprintln!("aim-server: SIGHUP: failed reloading keys: {e}"),
-                        },
+                        Ok(new_cfg) => {
+                            match keyring.reload_config(&new_cfg.keys, &new_cfg.groups) {
+                                Ok(n) => eprintln!(
+                                    "aim-server: SIGHUP: reloaded {n} keys and {} groups from {}",
+                                    new_cfg.groups.len(),
+                                    cfg_path.display()
+                                ),
+                                Err(e) => eprintln!(
+                                    "aim-server: SIGHUP: failed reloading keys/groups: {e}"
+                                ),
+                            }
+                        }
                         Err(e) => eprintln!(
                             "aim-server: SIGHUP: failed reading config {}: {e}",
                             cfg_path.display()

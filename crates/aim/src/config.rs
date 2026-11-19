@@ -322,15 +322,15 @@ pub fn resolve_agent(
     config_default: Option<&str>,
 ) -> Result<String, String> {
     if let Some(a) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        AgentId::parse_local(a)?;
+        validate_agent_identity(a)?;
         return Ok(a.to_string());
     }
     if let Some(a) = non_empty_env("AIM_AGENT") {
-        AgentId::parse_local(&a)?;
+        validate_agent_identity(&a)?;
         return Ok(a);
     }
     if let Some(a) = config_default.map(str::trim).filter(|s| !s.is_empty()) {
-        AgentId::parse_local(a)?;
+        validate_agent_identity(a)?;
         return Ok(a.to_string());
     }
     let harness_override = non_empty_env("AIM_HARNESS");
@@ -354,12 +354,24 @@ pub fn resolve_agent(
     Err("missing agent identity: pass --agent HARNESS:SESSION (for example agy:session1, codex:session2, claude:session3) or set AIM_AGENT".into())
 }
 
+fn validate_agent_identity(agent: &str) -> Result<(), String> {
+    AgentId::validate_identity(agent)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GitContext {
     pub repo: Option<String>,
     pub worktree: Option<String>,
     pub branch: Option<String>,
     pub head: Option<String>,
+}
+
+pub fn registration_git_context(cwd: &Path, explicit_repo: Option<&str>) -> GitContext {
+    let detected = detect_git_context(cwd);
+    match explicit_repo {
+        Some(repo) if detected.repo.as_deref() != Some(repo) => GitContext::default(),
+        _ => detected,
+    }
 }
 
 fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {

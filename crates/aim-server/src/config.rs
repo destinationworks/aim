@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aim_proto::names::{check_name, valid_name};
 use aim_proto::wire::{check_sha256, MAX_CLAIM_TTL_SECS, MAX_EXPIRY_SECS, MAX_LEASE_SECS};
+use aim_proto::AgentId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -13,6 +14,55 @@ pub struct KeyEntry {
     pub sha256: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupConfig {
+    pub name: String,
+    pub members: Vec<GroupMemberConfig>,
+    pub posting_permissions: Vec<GroupPostingPermission>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMemberConfig {
+    pub agent: String,
+    pub role: GroupRole,
+    pub responsibilities: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRole {
+    Owner,
+    Admin,
+    Coordinator,
+    Specialist,
+    Reviewer,
+    Observer,
+}
+
+impl GroupRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Coordinator => "coordinator",
+            Self::Specialist => "specialist",
+            Self::Reviewer => "reviewer",
+            Self::Observer => "observer",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupPostingPermission {
+    pub host: String,
+    pub task_categories: Vec<String>,
+    pub max_expires_in_secs: u64,
+    pub max_schedule_delay_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -55,6 +105,8 @@ pub struct ServerConfig {
     pub agent_retention_secs: u64,
     #[serde(default)]
     pub keys: Vec<KeyEntry>,
+    #[serde(default)]
+    pub groups: Vec<GroupConfig>,
 }
 
 fn default_listen() -> String {
@@ -141,6 +193,7 @@ impl ServerConfig {
             auth_failures_per_minute: default_auth_failures_per_minute(),
             agent_retention_secs: default_agent_retention(),
             keys: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -212,6 +265,7 @@ impl ServerConfig {
             }
         }
         let mut seen = HashSet::new();
+        let known_hosts: HashSet<&str> = self.keys.iter().map(|key| key.host.as_str()).collect();
         for key in &self.keys {
             check_name("key host", &key.host)?;
             check_sha256(&key.sha256)?;
@@ -219,6 +273,126 @@ impl ServerConfig {
                 return Err(format!(
                     "duplicate key sha256 in keys (host '{}'); every key must be unique",
                     key.host
+                ));
+            }
+        }
+        if self.groups.len() > 256 {
+            return Err("at most 256 groups may be configured".into());
+        }
+        let mut group_names = HashSet::new();
+        for group in &self.groups {
+            check_name("group", &group.name)?;
+            if !group_names.insert(&group.name) {
+                return Err(format!("duplicate group name '{}'", group.name));
+            }
+            if group.members.is_empty() || group.members.len() > 128 {
+                return Err(format!("group '{}' must have 1-128 members", group.name));
+            }
+            if group.posting_permissions.is_empty() || group.posting_permissions.len() > 128 {
+                return Err(format!(
+                    "group '{}' must have 1-128 posting_permissions",
+                    group.name
+                ));
+            }
+            let mut members = HashSet::new();
+            for member in &group.members {
+                let parsed = AgentId::parse_full(&member.agent)?;
+                if parsed.to_string() != member.agent {
+                    return Err(format!(
+                        "group '{}' member '{}' is not a canonical agent ID",
+                        group.name, member.agent
+                    ));
+                }
+                if !members.insert(&member.agent) {
+                    return Err(format!(
+                        "group '{}' contains duplicate member '{}'",
+                        group.name, member.agent
+                    ));
+                }
+                if !known_hosts.contains(parsed.host.as_str()) {
+                    return Err(format!(
+                        "group '{}' member '{}' uses unconfigured host '{}'",
+                        group.name, member.agent, parsed.host
+                    ));
+                }
+                let worker_role =
+                    matches!(member.role, GroupRole::Specialist | GroupRole::Reviewer);
+                if member.responsibilities.len() > 32
+                    || (worker_role && member.responsibilities.is_empty())
+                {
+                    return Err(format!(
+                        "group '{}' member '{}' has invalid responsibilities for its role",
+                        group.name, member.agent
+                    ));
+                }
+                let mut responsibilities = HashSet::new();
+                for category in &member.responsibilities {
+                    check_name("task category", category)?;
+                    if !responsibilities.insert(category) {
+                        return Err(format!(
+                            "group '{}' member '{}' repeats responsibility '{category}'",
+                            group.name, member.agent
+                        ));
+                    }
+                }
+            }
+            let mut posting_grants = HashSet::new();
+            for permission in &group.posting_permissions {
+                check_name("group posting host", &permission.host)?;
+                if !known_hosts.contains(permission.host.as_str()) {
+                    return Err(format!(
+                        "group '{}' posting host '{}' has no configured key",
+                        group.name, permission.host
+                    ));
+                }
+                if permission.task_categories.is_empty() || permission.task_categories.len() > 32 {
+                    return Err(format!(
+                        "group '{}' posting permission for '{}' must have 1-32 task_categories",
+                        group.name, permission.host
+                    ));
+                }
+                if permission.max_expires_in_secs == 0
+                    || permission.max_expires_in_secs > MAX_EXPIRY_SECS
+                {
+                    return Err(format!(
+                        "group '{}' posting permission for '{}' max_expires_in_secs must be between 1 and {MAX_EXPIRY_SECS}",
+                        group.name, permission.host
+                    ));
+                }
+                if permission.max_schedule_delay_secs > MAX_EXPIRY_SECS {
+                    return Err(format!(
+                        "group '{}' posting permission for '{}' max_schedule_delay_secs must be between 0 and {MAX_EXPIRY_SECS}",
+                        group.name, permission.host
+                    ));
+                }
+                let mut categories = HashSet::new();
+                for category in &permission.task_categories {
+                    check_name("task category", category)?;
+                    if !categories.insert(category)
+                        || !posting_grants.insert((permission.host.as_str(), category.as_str()))
+                    {
+                        return Err(format!(
+                            "group '{}' has a duplicate posting grant for '{}' category '{category}'",
+                            group.name, permission.host
+                        ));
+                    }
+                }
+            }
+
+            let member_categories: HashSet<&str> = group
+                .members
+                .iter()
+                .filter(|member| matches!(member.role, GroupRole::Specialist | GroupRole::Reviewer))
+                .flat_map(|member| member.responsibilities.iter().map(String::as_str))
+                .collect();
+            let posting_categories: HashSet<&str> = posting_grants
+                .iter()
+                .map(|(_, category)| *category)
+                .collect();
+            if member_categories != posting_categories {
+                return Err(format!(
+                    "group '{}' categories must have both a specialist/reviewer member and a posting permission",
+                    group.name
                 ));
             }
         }
@@ -284,6 +458,108 @@ mod tests {
             },
         ];
         assert!(cfg.validate().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn validates_group_roles_responsibilities_and_posting_grants() {
+        let mut cfg = ServerConfig::defaults_for("d".into(), "c".into(), "k".into());
+        cfg.groups = vec![GroupConfig {
+            name: "reviewers".into(),
+            members: vec![GroupMemberConfig {
+                agent: "macbook:codex:reviewer".into(),
+                role: GroupRole::Reviewer,
+                responsibilities: vec!["platform-verification".into()],
+            }],
+            posting_permissions: vec![GroupPostingPermission {
+                host: "workstation".into(),
+                task_categories: vec!["platform-verification".into()],
+                max_expires_in_secs: 3600,
+                max_schedule_delay_secs: 900,
+            }],
+        }];
+        cfg.keys = vec![
+            KeyEntry {
+                host: "macbook".into(),
+                sha256: "ab".repeat(32),
+                enabled: true,
+            },
+            KeyEntry {
+                host: "workstation".into(),
+                sha256: "cd".repeat(32),
+                enabled: true,
+            },
+            KeyEntry {
+                host: "win-dev".into(),
+                sha256: "ef".repeat(32),
+                enabled: true,
+            },
+        ];
+        cfg.validate().unwrap();
+
+        let duplicate_member = cfg.groups[0].members[0].clone();
+        cfg.groups[0].members.push(duplicate_member);
+        assert!(cfg.validate().unwrap_err().contains("duplicate member"));
+
+        cfg.groups[0].members[0].agent = "not-a-full-agent-id".into();
+        assert!(cfg.validate().unwrap_err().contains("HOST:HARNESS:SESSION"));
+
+        cfg.groups[0].members[0].agent = "macbook:codex:reviewer".into();
+        cfg.groups[0].posting_permissions.clear();
+        assert!(cfg.validate().unwrap_err().contains("posting_permissions"));
+    }
+
+    #[test]
+    fn rejects_group_categories_without_a_matching_worker_responsibility() {
+        let mut cfg = ServerConfig::defaults_for("d".into(), "c".into(), "k".into());
+        cfg.keys = vec![
+            KeyEntry {
+                host: "macbook".into(),
+                sha256: "ab".repeat(32),
+                enabled: true,
+            },
+            KeyEntry {
+                host: "workstation".into(),
+                sha256: "cd".repeat(32),
+                enabled: true,
+            },
+        ];
+        cfg.groups = vec![GroupConfig {
+            name: "reviewers".into(),
+            members: vec![GroupMemberConfig {
+                agent: "macbook:codex:reviewer".into(),
+                role: GroupRole::Observer,
+                responsibilities: vec![],
+            }],
+            posting_permissions: vec![GroupPostingPermission {
+                host: "workstation".into(),
+                task_categories: vec!["platform-verification".into()],
+                max_expires_in_secs: 3600,
+                max_schedule_delay_secs: 900,
+            }],
+        }];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("specialist/reviewer member"));
+    }
+
+    #[test]
+    fn parses_role_and_category_grants_from_toml() {
+        let raw = r#"
+name = "mac-reviewers"
+members = [
+  { agent = "mac:codex:reviewer", role = "reviewer", responsibilities = ["platform-verification"] },
+]
+posting_permissions = [
+  { host = "pc2", task_categories = ["platform-verification"], max_expires_in_secs = 3600, max_schedule_delay_secs = 900 },
+]
+"#;
+
+        let group: GroupConfig = toml::from_str(raw).unwrap();
+        assert_eq!(group.members[0].role, GroupRole::Reviewer);
+        assert_eq!(group.members[0].responsibilities, ["platform-verification"]);
+        assert_eq!(group.posting_permissions[0].max_expires_in_secs, 3600);
+        assert_eq!(group.posting_permissions[0].max_schedule_delay_secs, 900);
     }
 
     #[test]

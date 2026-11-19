@@ -74,7 +74,7 @@ pub struct RegisterRequest {
 
 impl RegisterRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if let Some(repo) = &self.repo {
             check_name("repo", repo)?;
         }
@@ -130,13 +130,20 @@ pub struct SendRequest {
     pub expires_in_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_secs: Option<u64>,
+    /// Category requested from a configured worker group or declared for a
+    /// categorized exact-recipient root request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_category: Option<String>,
+    /// Earliest time a wake consumer should dispatch a scheduled root request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_ms: Option<i64>,
 }
 
 impl SendRequest {
     /// Checks everything that does not need the hub's state and returns the
     /// parsed recipients.
     pub fn validate(&self) -> Result<Vec<Selector>, String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if self.body.trim().is_empty() {
             return Err("body is empty".into());
         }
@@ -163,6 +170,47 @@ impl SendRequest {
             .iter()
             .map(|t| Selector::parse(t))
             .collect::<Result<Vec<_>, _>>()?;
+        let group_request = selectors
+            .iter()
+            .any(|selector| matches!(selector, Selector::Group(_)));
+        let root_request = self.performative.is_request() && self.reply_to.is_none();
+        if group_request && (selectors.len() != 1 || !root_request) {
+            return Err(
+                "group recipient must be the sole recipient of a root REQUEST or REQUEST_VERIFY"
+                    .into(),
+            );
+        }
+        let exact_agent_request = root_request
+            && selectors.len() == 1
+            && matches!(selectors.first(), Some(Selector::Agent(_)));
+        if let Some(category) = &self.task_category {
+            check_name("task category", category)?;
+            if !group_request && !exact_agent_request {
+                return Err(
+                    "task_category requires a root group or exact-recipient request".into(),
+                );
+            }
+        }
+        if group_request {
+            if self.task_category.is_none() {
+                return Err("group request requires task_category".into());
+            }
+            if self.expires_in_secs.is_none() {
+                return Err("group request requires expires_in_secs".into());
+            }
+        }
+        if let Some(not_before_ms) = self.not_before_ms {
+            if not_before_ms <= 0 {
+                return Err(
+                    "not_before_ms must be a positive Unix timestamp in milliseconds".into(),
+                );
+            }
+            if !group_request && !(exact_agent_request && self.task_category.is_some()) {
+                return Err(
+                    "not_before_ms requires a group or categorized exact-recipient request".into(),
+                );
+            }
+        }
         if let Some(thread) = &self.thread {
             check_name("thread", thread)?;
         }
@@ -229,6 +277,17 @@ pub struct SendResponse {
     pub thread: String,
     /// The idempotency key was seen before; nothing new was stored.
     pub duplicate: bool,
+    /// Worker selected for a server-configured group request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,6 +298,14 @@ pub struct Message {
     pub expires_ms: i64,
     pub sender: String,
     pub to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_ms: Option<i64>,
     pub performative: Performative,
     pub thread: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,7 +319,11 @@ pub struct Message {
 pub struct InboxResponse {
     pub notice: String,
     pub messages: Vec<Message>,
-    /// Pass as `after` to continue from here.
+    /// Highest stored message sequence in this SQLite read snapshot.
+    #[serde(default)]
+    pub seq_head: u64,
+    /// Pass as `after` to continue this reader's scan. Reading with an
+    /// explicit `after` does not advance the agent's interactive read position.
     pub next_after: u64,
     /// The read position stored on the hub for this agent.
     pub read_position: u64,
@@ -266,7 +337,7 @@ pub struct AckRequest {
 
 impl AckRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if i64::try_from(self.read_to).is_err() {
             return Err("read_to sequence number is out of range".into());
         }
@@ -319,7 +390,7 @@ pub struct ClaimRequest {
 
 impl ClaimRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         check_name("repo", &self.repo)?;
         if self.paths.is_empty() || self.paths.len() > MAX_CLAIM_PATHS {
             return Err(format!("name 1-{MAX_CLAIM_PATHS} paths"));
@@ -378,7 +449,7 @@ pub struct ReleaseRequest {
 
 impl ReleaseRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if let Some(repo) = &self.repo {
             check_name("repo", repo)?;
         }
@@ -494,6 +565,8 @@ mod tests {
             idempotency_key: None,
             expires_in_secs: None,
             lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
         }
     }
 
@@ -543,6 +616,64 @@ mod tests {
         assert!(check_artifact_name("bad file.log").is_err());
         assert!(check_artifact_name("bad\u{00e9}.log").is_err());
         assert!(check_artifact_name("../secret.log").is_err());
+    }
+
+    #[test]
+    fn group_requests_require_a_category_and_explicit_expiry() {
+        let mut request = send(Performative::Request, "run verification");
+        request.to = vec!["group:reviewers".into()];
+        assert!(request.validate().unwrap_err().contains("task_category"));
+
+        request.task_category = Some("platform-verification".into());
+        assert!(request.validate().unwrap_err().contains("expires_in_secs"));
+
+        request.expires_in_secs = Some(3600);
+        request.not_before_ms = Some(1_800_000_000_000);
+        assert!(request.validate().is_ok());
+
+        request.task_category = Some("invalid category".into());
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn direct_request_categories_and_schedules_require_an_exact_root_request() {
+        let mut request = send(Performative::Request, "run verification");
+        request.to = vec!["macbook:codex:reviewer".into()];
+        assert!(request.validate().is_ok());
+
+        request.task_category = Some("platform-verification".into());
+        request.not_before_ms = Some(1_800_000_000_000);
+        assert!(request.validate().is_ok());
+
+        request.to = vec!["host:macbook".into()];
+        assert!(request.validate().unwrap_err().contains("task_category"));
+
+        request.to = vec!["macbook:codex:reviewer".into()];
+        request.performative = Performative::Reply;
+        request.reply_to = Some(42);
+        assert!(request.validate().unwrap_err().contains("task_category"));
+    }
+
+    #[test]
+    fn inbox_snapshot_head_is_serialized_and_defaults_for_older_hubs() {
+        let response = InboxResponse {
+            notice: "untrusted".into(),
+            messages: Vec::new(),
+            seq_head: 12,
+            next_after: 12,
+            read_position: 3,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["seq_head"], 12);
+
+        let older_response: InboxResponse = serde_json::from_value(serde_json::json!({
+            "notice": "untrusted",
+            "messages": [],
+            "next_after": 12,
+            "read_position": 3
+        }))
+        .unwrap();
+        assert_eq!(older_response.seq_head, 0);
     }
 
     #[test]

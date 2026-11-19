@@ -26,10 +26,27 @@ impl AgentId {
         Ok((harness, session))
     }
 
+    /// Validates either client-local `HARNESS:SESSION` or canonical
+    /// `HOST:HARNESS:SESSION` syntax. Host binding is enforced by `from_local`.
+    pub fn validate_identity(text: &str) -> Result<(), String> {
+        if text.matches(':').count() == 2 {
+            Self::parse_full(text).map(|_| ())
+        } else {
+            Self::parse_local(text).map(|_| ())
+        }
+    }
+
     /// Parses the client-side `harness:session` form and binds it to `host`.
     pub fn from_local(host: &str, local: &str) -> Result<Self, String> {
-        let (harness, session) = Self::parse_local(local)?;
         check_name("host", host)?;
+        if local.matches(':').count() == 2 {
+            let full = Self::parse_full(local)?;
+            if full.host != host {
+                return Err("agent host does not match authenticated host".into());
+            }
+            return Ok(full);
+        }
+        let (harness, session) = Self::parse_local(local)?;
         Ok(Self {
             host: host.into(),
             harness: harness.into(),
@@ -75,6 +92,8 @@ pub enum Selector {
     Repo(String),
     /// `cap:NAME`: every agent advertising that capability.
     Cap(String),
+    /// `group:NAME`: server-configured group, resolved to one member for a request.
+    Group(String),
     /// `HOST:HARNESS:SESSION`: exactly one agent.
     Agent(AgentId),
     /// `SESSION`: the agent with this session id, on any computer.
@@ -100,8 +119,9 @@ impl Selector {
                     "harness" => Ok(Self::Harness(name)),
                     "repo" => Ok(Self::Repo(name)),
                     "cap" => Ok(Self::Cap(name)),
+                    "group" => Ok(Self::Group(name)),
                     _ => Err(format!(
-                        "unknown recipient kind '{kind}': use *, host:NAME, harness:NAME, repo:NAME, cap:NAME, SESSION or HOST:HARNESS:SESSION"
+                        "unknown recipient kind '{kind}': use *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION or HOST:HARNESS:SESSION"
                     )),
                 }
             }
@@ -125,6 +145,8 @@ impl Selector {
             Self::Harness(harness) => *harness == recipient.id.harness,
             Self::Repo(repo) => recipient.repo == Some(repo.as_str()),
             Self::Cap(cap) => recipient.caps.iter().any(|c| c == cap),
+            // The hub resolves groups before storing messages.
+            Self::Group(_) => false,
             Self::Agent(id) => id == recipient.id,
             Self::Session(session) => *session == recipient.id.session,
         }
@@ -139,6 +161,7 @@ impl fmt::Display for Selector {
             Self::Harness(n) => write!(f, "harness:{n}"),
             Self::Repo(n) => write!(f, "repo:{n}"),
             Self::Cap(n) => write!(f, "cap:{n}"),
+            Self::Group(n) => write!(f, "group:{n}"),
             Self::Agent(id) => write!(f, "{id}"),
             Self::Session(s) => f.write_str(s),
         }
@@ -182,6 +205,11 @@ mod tests {
     fn local_ids_bind_to_the_key_host() {
         let agent = AgentId::from_local("host-b", "codex:s1").unwrap();
         assert_eq!(agent.to_string(), "host-b:codex:s1");
+        assert_eq!(
+            AgentId::from_local("host-b", "host-b:codex:s1").unwrap(),
+            agent
+        );
+        assert!(AgentId::from_local("host-b", "host-a:codex:s1").is_err());
         assert!(AgentId::from_local("host-b", "codex").is_err());
         assert!(AgentId::from_local("host-b", "codex:a:b").is_err());
         assert!(AgentId::from_local("host-b", ":x").is_err());
@@ -195,6 +223,7 @@ mod tests {
             "harness:agy",
             "repo:example-repo",
             "cap:macos-gui",
+            "group:reviewers",
             "host-b:agy:s1",
             "s1",
         ] {

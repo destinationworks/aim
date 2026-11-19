@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::client::AimClient;
 use crate::config::{
-    default_config_path, default_os_caps, detect_git_context, normalize_base_url, ConfigFile,
-    Overrides, ResolvedConfig,
+    default_config_path, default_os_caps, detect_git_context, normalize_base_url,
+    registration_git_context, ConfigFile, Overrides, ResolvedConfig,
 };
 use crate::mcp;
 
@@ -124,7 +124,7 @@ pub struct RegisterArgs {
 
 #[derive(Args)]
 pub struct SendArgs {
-    /// Recipient selector(s): *, host:NAME, harness:NAME, repo:NAME, cap:NAME, SESSION, HOST:HARNESS:SESSION
+    /// Recipient selector(s): *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION, HOST:HARNESS:SESSION
     #[arg(long, required = true, value_delimiter = ',')]
     pub to: Vec<String>,
     /// Message type: ANNOUNCE, QUERY, REPLY, REQUEST, REQUEST_VERIFY, ACCEPT, REJECT, PROGRESS, RESULT, ALERT, BLOCKER, CONFLICT
@@ -154,6 +154,12 @@ pub struct SendArgs {
     /// Expiry in seconds
     #[arg(long)]
     pub expires: Option<u64>,
+    /// Task category required for group:NAME, optional for exact-recipient root requests
+    #[arg(long)]
+    pub task_category: Option<String>,
+    /// Earliest wake time as a Unix timestamp in milliseconds
+    #[arg(long)]
+    pub not_before_ms: Option<i64>,
     /// Lease duration in seconds for ACCEPT or PROGRESS
     #[arg(long)]
     pub lease: Option<u64>,
@@ -277,7 +283,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         Command::Register(args) => {
             let agent = cfg.resolve_agent(agent_arg)?;
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            let git = detect_git_context(&cwd);
+            let git = registration_git_context(&cwd, args.repo.as_deref());
             let mut caps = if cfg.caps.is_empty() {
                 default_os_caps()
             } else {
@@ -329,6 +335,8 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                 idempotency_key: args.idempotency_key,
                 expires_in_secs: args.expires,
                 lease_secs: args.lease,
+                task_category: args.task_category,
+                not_before_ms: args.not_before_ms,
             };
             req.validate()?;
 
@@ -489,7 +497,7 @@ fn run_init(config_override: Option<&Path>, args: InitArgs, pretty: bool) -> Res
     crate::config::SecretKey::from_raw(key_raw)?;
 
     if let Some(ref agent) = args.default_agent {
-        aim_proto::AgentId::parse_local(agent)?;
+        aim_proto::AgentId::validate_identity(agent)?;
     }
     for c in &args.cap {
         check_name("capability", c)?;

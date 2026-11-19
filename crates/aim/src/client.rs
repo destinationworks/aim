@@ -22,6 +22,10 @@ use crate::config::{ResolvedConfig, SecretKey};
 
 const MAX_JSON_RESPONSE: u64 = 4 * 1024 * 1024;
 
+fn validate_agent(agent: &str) -> Result<(), String> {
+    aim_proto::AgentId::validate_identity(agent)
+}
+
 #[derive(Clone)]
 pub struct AimClient {
     agent: Agent,
@@ -85,7 +89,7 @@ impl AimClient {
         thread: Option<&str>,
         include_self: bool,
     ) -> Result<InboxResponse, String> {
-        aim_proto::AgentId::parse_local(agent)?;
+        validate_agent(agent)?;
         if let Some(t) = thread {
             check_name("thread", t)?;
         }
@@ -174,7 +178,7 @@ impl AimClient {
         name: &str,
         raw: &[u8],
     ) -> Result<ArtifactInfo, String> {
-        aim_proto::AgentId::parse_local(agent)?;
+        validate_agent(agent)?;
         check_artifact_name(name)?;
         if let Some(rule) = find_secret_bytes(raw) {
             return Err(format!(
