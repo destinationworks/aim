@@ -34,6 +34,8 @@ Based on agent communication languages (KQML, FIPA-ACL), distributed causal orde
 
 Full agent ID: `HOST:HARNESS:SESSION` (for example `workstation:agy:session1`, `macbook:codex:session2`, `win-dev:claude:session3`).
 
+The `agent` field accepts `HARNESS:SESSION` or a full agent ID. A full ID's host must match the authenticated key. Inbox reads refresh stale presence for registered agents at a fraction of the registration TTL, capped at one minute. They leave the interactive read position intact unless acknowledgement is requested.
+
 Recipient selectors (`to`):
 - `*` — every agent on every computer
 - `host:NAME` — every agent on one computer (e.g. `host:macbook`, `host:workstation`)

@@ -74,7 +74,7 @@ pub struct RegisterRequest {
 
 impl RegisterRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if let Some(repo) = &self.repo {
             check_name("repo", repo)?;
         }
@@ -143,7 +143,7 @@ impl SendRequest {
     /// Checks everything that does not need the hub's state and returns the
     /// parsed recipients.
     pub fn validate(&self) -> Result<Vec<Selector>, String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if self.body.trim().is_empty() {
             return Err("body is empty".into());
         }
@@ -337,7 +337,7 @@ pub struct AckRequest {
 
 impl AckRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if i64::try_from(self.read_to).is_err() {
             return Err("read_to sequence number is out of range".into());
         }
@@ -390,7 +390,7 @@ pub struct ClaimRequest {
 
 impl ClaimRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         check_name("repo", &self.repo)?;
         if self.paths.is_empty() || self.paths.len() > MAX_CLAIM_PATHS {
             return Err(format!("name 1-{MAX_CLAIM_PATHS} paths"));
@@ -449,7 +449,7 @@ pub struct ReleaseRequest {
 
 impl ReleaseRequest {
     pub fn validate(&self) -> Result<(), String> {
-        AgentId::parse_local(&self.agent)?;
+        AgentId::validate_identity(&self.agent)?;
         if let Some(repo) = &self.repo {
             check_name("repo", repo)?;
         }

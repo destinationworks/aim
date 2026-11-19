@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::client::AimClient;
 use crate::config::{
-    default_config_path, default_os_caps, detect_git_context, normalize_base_url, ConfigFile,
-    Overrides, ResolvedConfig,
+    default_config_path, default_os_caps, detect_git_context, normalize_base_url,
+    registration_git_context, ConfigFile, Overrides, ResolvedConfig,
 };
 use crate::mcp;
 
@@ -283,7 +283,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         Command::Register(args) => {
             let agent = cfg.resolve_agent(agent_arg)?;
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            let git = detect_git_context(&cwd);
+            let git = registration_git_context(&cwd, args.repo.as_deref());
             let mut caps = if cfg.caps.is_empty() {
                 default_os_caps()
             } else {
@@ -497,7 +497,7 @@ fn run_init(config_override: Option<&Path>, args: InitArgs, pretty: bool) -> Res
     crate::config::SecretKey::from_raw(key_raw)?;
 
     if let Some(ref agent) = args.default_agent {
-        aim_proto::AgentId::parse_local(agent)?;
+        aim_proto::AgentId::validate_identity(agent)?;
     }
     for c in &args.cap {
         check_name("capability", c)?;

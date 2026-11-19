@@ -9,7 +9,9 @@ use aim_proto::{Performative, UNTRUSTED_NOTICE};
 use serde_json::{json, Value};
 
 use crate::client::AimClient;
-use crate::config::{default_os_caps, detect_git_context, ResolvedConfig};
+use crate::config::{
+    default_os_caps, detect_git_context, registration_git_context, ResolvedConfig,
+};
 
 const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
 const MAX_CONCURRENT_TOOL_CALLS: usize = 16;
@@ -369,7 +371,8 @@ fn execute_tool(
         "aim_register" => {
             let agent = resolve(opt_str(args, "agent")?)?;
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            let git = detect_git_context(&cwd);
+            let explicit_repo = opt_str(args, "repo")?;
+            let git = registration_git_context(&cwd, explicit_repo.as_deref());
             let mut caps = cfg.caps.clone();
             if caps.is_empty() {
                 caps = default_os_caps();
@@ -381,7 +384,7 @@ fn execute_tool(
             }
             let req = RegisterRequest {
                 agent,
-                repo: opt_str(args, "repo")?.or(git.repo),
+                repo: explicit_repo.or(git.repo),
                 worktree: opt_str(args, "worktree")?.or(git.worktree),
                 branch: opt_str(args, "branch")?.or(git.branch),
                 head: opt_str(args, "head")?.or(git.head),
@@ -648,6 +651,20 @@ fn tool_definitions() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn explicit_repo_override_does_not_use_current_checkout_context() {
+        let explicit_repo = Some("destinationworks/aim".to_string());
+        let git = registration_git_context(Path::new("."), explicit_repo.as_deref());
+        assert_eq!(
+            explicit_repo.or(git.repo).as_deref(),
+            Some("destinationworks/aim")
+        );
+        assert_eq!(git.worktree, None);
+        assert_eq!(git.branch, None);
+        assert_eq!(git.head, None);
+    }
 
     #[test]
     fn strict_extractors_reject_wrong_types() {

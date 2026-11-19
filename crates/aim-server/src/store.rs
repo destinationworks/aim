@@ -1105,19 +1105,19 @@ impl Store {
         let tx = db.unchecked_transaction()?;
 
         let agent_str = agent_id.to_string();
-        let agent_meta: Option<(Option<String>, String, i64)> = tx
+        let agent_meta: Option<(Option<String>, String, i64, i64)> = tx
             .query_row(
-                "SELECT repo, caps_json, read_position FROM agents WHERE id=?1",
+                "SELECT repo, caps_json, read_position, seen_ms FROM agents WHERE id=?1",
                 [&agent_str],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let (repo, caps, read_position) = match agent_meta {
-            Some((repo, caps_json, rp)) => {
+        let (repo, caps, read_position, seen_ms) = match agent_meta {
+            Some((repo, caps_json, rp, seen_ms)) => {
                 let caps: Vec<String> = serde_json::from_str(&caps_json).unwrap_or_default();
-                (repo, caps, rp.max(0) as u64)
+                (repo, caps, rp.max(0) as u64, Some(seen_ms))
             }
-            None => (None, Vec::new(), 0),
+            None => (None, Vec::new(), 0, None),
         };
         let recipient = Recipient {
             id: &agent_id,
@@ -1189,6 +1189,19 @@ impl Store {
         };
 
         tx.commit()?;
+
+        // Refresh presence after the read snapshot is closed. This endpoint is
+        // the listener heartbeat, throttled to a fraction of the agent TTL.
+        let heartbeat_cutoff = now.saturating_sub((self.cfg.agent_ttl_ms / 3).clamp(1, 60_000));
+        if seen_ms.is_some_and(|seen| seen <= heartbeat_cutoff) {
+            self.conn
+                .lock()
+                .map_err(|_| StoreError::Internal("db lock poisoned".into()))?
+                .execute(
+                    "UPDATE agents SET seen_ms=?2 WHERE id=?1 AND seen_ms<=?3",
+                    params![agent_str, now, heartbeat_cutoff],
+                )?;
+        }
         Ok(InboxResponse {
             notice: UNTRUSTED_NOTICE.to_string(),
             messages,
@@ -1950,6 +1963,80 @@ mod schema_tests {
     };
 
     #[test]
+    fn inbox_refreshes_stale_registered_presence_and_throttles_recent_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("data"), StoreConfig::default()).unwrap();
+        let request = RegisterRequest {
+            agent: "codex:worker".into(),
+            ..RegisterRequest::default()
+        };
+        store.register("host", request).unwrap();
+        let id = "host:codex:worker";
+        let stale = now_ms().saturating_sub(360_000);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agents SET seen_ms=?2 WHERE id=?1",
+                params![id, stale],
+            )
+            .unwrap();
+
+        let poll_started = now_ms();
+        store
+            .inbox("host", "codex:worker", Some(0), Some(10), None, false)
+            .unwrap();
+        let refreshed: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT seen_ms FROM agents WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(refreshed >= poll_started);
+
+        let recent = now_ms().saturating_sub(30_000);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agents SET seen_ms=?2 WHERE id=?1",
+                params![id, recent],
+            )
+            .unwrap();
+        store
+            .inbox("host", "codex:worker", Some(0), Some(10), None, false)
+            .unwrap();
+        let throttled: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT seen_ms FROM agents WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(throttled, recent);
+
+        store
+            .inbox("host", "codex:unknown", None, None, None, false)
+            .unwrap();
+        let unknown_registered: bool = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id='host:codex:unknown')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!unknown_registered);
+    }
+
+    #[test]
     fn adds_group_assignment_columns_to_existing_message_schema() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -2070,7 +2157,8 @@ mod schema_tests {
             groups: vec![group.clone()],
             ..StoreConfig::default()
         };
-        let store = Store::open_with_keyring(dir.path(), store_cfg, keyring.clone()).unwrap();
+        let store =
+            Store::open_with_keyring(&dir.path().join("data"), store_cfg, keyring.clone()).unwrap();
 
         store
             .register(
@@ -2176,7 +2264,7 @@ mod schema_tests {
     #[test]
     fn expired_retained_message_reserves_its_idempotency_key_until_pruned() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), StoreConfig::default()).unwrap();
+        let store = Store::open(&dir.path().join("data"), StoreConfig::default()).unwrap();
         let request = SendRequest {
             agent: "agy:sender".into(),
             to: vec!["mac:codex:reviewer".into()],
@@ -2218,7 +2306,7 @@ mod schema_tests {
     #[test]
     fn migrated_legacy_idempotency_rows_allow_semantic_exact_retries() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), StoreConfig::default()).unwrap();
+        let store = Store::open(&dir.path().join("data"), StoreConfig::default()).unwrap();
         let request = SendRequest {
             agent: "agy:sender".into(),
             to: vec!["mac:codex:reviewer".into()],

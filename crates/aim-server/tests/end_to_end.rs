@@ -1263,7 +1263,7 @@ async fn mcp_stdio_roundtrip_against_live_tls_hub() {
             .env("AIM_URL", h.base_url.as_str())
             .env("AIM_CA_CERT", &h.ca_cert)
             .env("AIM_KEY_FILE", &h.mac_key)
-            .env("AIM_AGENT", "claude:mcp-1")
+            .env("AIM_AGENT", "macbook:claude:mcp-1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1277,6 +1277,7 @@ async fn mcp_stdio_roundtrip_against_live_tls_hub() {
             writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
             writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"aim_register","arguments":{{"note":"via mcp"}}}}}}"#).unwrap();
             writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"aim_status","arguments":{{}}}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"aim_register","arguments":{{"agent":"workstation:claude:mcp-1"}}}}}}"#).unwrap();
         }
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1289,7 +1290,7 @@ async fn mcp_stdio_roundtrip_against_live_tls_hub() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), 4);
+    assert_eq!(lines.len(), 5);
     lines.sort_by_key(|v| v["id"].as_i64().unwrap_or(0));
     assert_eq!(lines[0]["id"], 1);
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "aim");
@@ -1303,6 +1304,12 @@ async fn mcp_stdio_roundtrip_against_live_tls_hub() {
         .contains("macbook:claude:mcp-1"));
     assert_eq!(lines[3]["id"], 4);
     assert_eq!(lines[3]["result"]["isError"], false);
+    assert_eq!(lines[4]["id"], 5);
+    assert_eq!(lines[4]["result"]["isError"], true);
+    assert!(lines[4]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("agent host does not match authenticated host"));
 }
 
 #[tokio::test]

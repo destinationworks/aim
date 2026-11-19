@@ -26,10 +26,27 @@ impl AgentId {
         Ok((harness, session))
     }
 
+    /// Validates either client-local `HARNESS:SESSION` or canonical
+    /// `HOST:HARNESS:SESSION` syntax. Host binding is enforced by `from_local`.
+    pub fn validate_identity(text: &str) -> Result<(), String> {
+        if text.matches(':').count() == 2 {
+            Self::parse_full(text).map(|_| ())
+        } else {
+            Self::parse_local(text).map(|_| ())
+        }
+    }
+
     /// Parses the client-side `harness:session` form and binds it to `host`.
     pub fn from_local(host: &str, local: &str) -> Result<Self, String> {
-        let (harness, session) = Self::parse_local(local)?;
         check_name("host", host)?;
+        if local.matches(':').count() == 2 {
+            let full = Self::parse_full(local)?;
+            if full.host != host {
+                return Err("agent host does not match authenticated host".into());
+            }
+            return Ok(full);
+        }
+        let (harness, session) = Self::parse_local(local)?;
         Ok(Self {
             host: host.into(),
             harness: harness.into(),
@@ -188,6 +205,11 @@ mod tests {
     fn local_ids_bind_to_the_key_host() {
         let agent = AgentId::from_local("host-b", "codex:s1").unwrap();
         assert_eq!(agent.to_string(), "host-b:codex:s1");
+        assert_eq!(
+            AgentId::from_local("host-b", "host-b:codex:s1").unwrap(),
+            agent
+        );
+        assert!(AgentId::from_local("host-b", "host-a:codex:s1").is_err());
         assert!(AgentId::from_local("host-b", "codex").is_err());
         assert!(AgentId::from_local("host-b", "codex:a:b").is_err());
         assert!(AgentId::from_local("host-b", ":x").is_err());
