@@ -148,6 +148,25 @@ pub struct Store {
     keyring: Option<crate::auth::KeyRing>,
 }
 
+struct ExistingSendRequest {
+    seq: i64,
+    msg_id: String,
+    thread: String,
+    expires_ms: i64,
+    assigned_group: Option<String>,
+    assigned_to: Option<String>,
+    task_category: Option<String>,
+    assigned_role: Option<String>,
+    not_before_ms: Option<i64>,
+    idempotency_fingerprint: Option<String>,
+    created_ms: i64,
+    to_json: String,
+    performative: String,
+    reply_to: Option<i64>,
+    body: String,
+    payload_json: Option<String>,
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -549,24 +568,7 @@ impl Store {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         if let Some(ref idem) = req.idempotency_key {
-            let existing: Option<(
-                i64,
-                String,
-                String,
-                i64,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<i64>,
-                Option<String>,
-                i64,
-                String,
-                String,
-                Option<i64>,
-                String,
-                Option<String>,
-            )> = tx
+            let existing: Option<ExistingSendRequest> = tx
                 .query_row(
                     "SELECT seq, msg_id, thread, expires_ms, assigned_group, assigned_to,
                             task_category, assigned_role, not_before_ms,
@@ -575,46 +577,46 @@ impl Store {
                      FROM messages WHERE sender=?1 AND idempotency_key=?2",
                     params![&sender_str, idem],
                     |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                            r.get(8)?,
-                            r.get(9)?,
-                            r.get(10)?,
-                            r.get(11)?,
-                            r.get(12)?,
-                            r.get(13)?,
-                            r.get(14)?,
-                            r.get(15)?,
-                        ))
+                        Ok(ExistingSendRequest {
+                            seq: r.get(0)?,
+                            msg_id: r.get(1)?,
+                            thread: r.get(2)?,
+                            expires_ms: r.get(3)?,
+                            assigned_group: r.get(4)?,
+                            assigned_to: r.get(5)?,
+                            task_category: r.get(6)?,
+                            assigned_role: r.get(7)?,
+                            not_before_ms: r.get(8)?,
+                            idempotency_fingerprint: r.get(9)?,
+                            created_ms: r.get(10)?,
+                            to_json: r.get(11)?,
+                            performative: r.get(12)?,
+                            reply_to: r.get(13)?,
+                            body: r.get(14)?,
+                            payload_json: r.get(15)?,
+                        })
                     },
                 )
                 .optional()?;
-            if let Some((
-                seq,
-                msg_id,
-                thread,
-                expires_ms,
-                stored_group,
-                stored_assignee,
-                stored_category,
-                stored_role,
-                stored_not_before_ms,
-                stored_fingerprint,
-                created_ms,
-                stored_to_json,
-                stored_performative,
-                stored_reply_to,
-                stored_body,
-                stored_payload_json,
-            )) = existing
-            {
+            if let Some(existing) = existing {
+                let ExistingSendRequest {
+                    seq,
+                    msg_id,
+                    thread,
+                    expires_ms,
+                    assigned_group: stored_group,
+                    assigned_to: stored_assignee,
+                    task_category: stored_category,
+                    assigned_role: stored_role,
+                    not_before_ms: stored_not_before_ms,
+                    idempotency_fingerprint: stored_fingerprint,
+                    created_ms,
+                    to_json: stored_to_json,
+                    performative: stored_performative,
+                    reply_to: stored_reply_to,
+                    body: stored_body,
+                    payload_json: stored_payload_json,
+                } = existing;
                 if expires_ms <= now {
                     return Err(StoreError::Conflict(
                         "idempotency key belongs to an expired retained message".into(),
@@ -725,6 +727,7 @@ impl Store {
                 let Some(permission) = permission else {
                     return Err(StoreError::NotFound("group not found".into()));
                 };
+                let max_schedule_delay_secs = permission.max_schedule_delay_secs;
                 let expires_in_secs = req
                     .expires_in_secs
                     .expect("group request validation requires expires_in_secs");
@@ -733,7 +736,7 @@ impl Store {
                         "expires_in_secs exceeds the group posting grant".into(),
                     ));
                 }
-                Ok((group, enabled_hosts, permission.max_schedule_delay_secs))
+                Ok((group, enabled_hosts, max_schedule_delay_secs))
             })
             .transpose()?;
 

@@ -161,7 +161,7 @@ mod tests {
                 "mac:agy:sender"
             )
             .unwrap(),
-            candidates[1]
+            candidates[2]
         );
         assert_eq!(
             choose(

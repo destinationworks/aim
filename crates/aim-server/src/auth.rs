@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::{GroupConfig, GroupMemberConfig, GroupPostingPermission, GroupRole, KeyEntry};
+use crate::config::{GroupConfig, KeyEntry};
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedHost(pub String);
@@ -346,6 +346,7 @@ fn too_many_requests() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GroupMemberConfig, GroupPostingPermission, GroupRole};
 
     #[test]
     fn token_generation_and_constant_time_auth() {
