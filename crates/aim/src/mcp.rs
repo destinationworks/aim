@@ -269,10 +269,17 @@ fn handle_sync_rpc(
     }
 }
 
+fn strip_wire_notice(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("notice");
+    }
+    value
+}
+
 fn dispatch_tool(cfg: &ResolvedConfig, client: &AimClient, name: &str, args: &Value) -> Value {
     match execute_tool(cfg, client, name, args) {
         Ok((notice, value)) => {
-            let json_text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into());
+            let json_text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
             let mut content = Vec::new();
             if let Some(n) = notice {
                 content.push(json!({ "type": "text", "text": n }));
@@ -440,24 +447,36 @@ fn execute_tool(
             let thread = opt_str(args, "thread")?;
             let include_self = opt_bool(args, "include_self")?.unwrap_or(false);
             let auto_ack = opt_bool(args, "ack")?.unwrap_or(false);
-            if auto_ack && (thread.is_some() || after.is_some()) {
+            if auto_ack && thread.is_some() {
                 return Err(
-                    "ack=true cannot be combined with thread or after (would skip unread messages)"
-                        .into(),
+                    "ack=true cannot be combined with thread (would skip unread messages)".into(),
                 );
             }
             let mut res =
                 client.inbox(&agent, after, wait, limit, thread.as_deref(), include_self)?;
-            if auto_ack && res.next_after > res.read_position {
-                let acked = client.ack(&AckRequest {
-                    agent,
-                    read_to: res.next_after,
-                })?;
-                res.read_position = acked.read_position;
+            if auto_ack {
+                if after.is_some_and(|cursor| cursor > res.read_position) {
+                    return Err(
+                        "ack=true with after > read_position would skip unread messages; omit after or call aim_ack explicitly"
+                            .into(),
+                    );
+                }
+                if res.next_after > res.read_position {
+                    let acked = client.ack(&AckRequest {
+                        agent,
+                        read_to: res.next_after,
+                    })?;
+                    res.read_position = acked.read_position;
+                }
             }
+            let notice = if res.messages.is_empty() {
+                None
+            } else {
+                Some(UNTRUSTED_NOTICE)
+            };
             Ok((
-                Some(UNTRUSTED_NOTICE),
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
+                notice,
+                strip_wire_notice(serde_json::to_value(res).map_err(|e| e.to_string())?),
             ))
         }
         "aim_ack" => {
@@ -503,19 +522,32 @@ fn execute_tool(
             Ok((None, res))
         }
         "aim_status" => {
-            let res = client.status()?;
+            let include_stale = opt_bool(args, "include_stale")?.unwrap_or(false);
+            let res = client.status_filtered(!include_stale)?;
+            let notice =
+                if res.agents.is_empty() && res.claims.is_empty() && res.open_requests.is_empty() {
+                    None
+                } else {
+                    Some(UNTRUSTED_NOTICE)
+                };
             Ok((
-                Some(UNTRUSTED_NOTICE),
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
+                notice,
+                strip_wire_notice(serde_json::to_value(res).map_err(|e| e.to_string())?),
             ))
         }
         "aim_thread" => {
             let thread = opt_str(args, "thread")?.ok_or("thread is required")?;
             check_name("thread", &thread)?;
-            let res = client.thread(&thread)?;
+            let after = opt_u64(args, "after")?;
+            let res = client.thread_after(&thread, after)?;
+            let notice = if res.messages.is_empty() {
+                None
+            } else {
+                Some(UNTRUSTED_NOTICE)
+            };
             Ok((
-                Some(UNTRUSTED_NOTICE),
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
+                notice,
+                strip_wire_notice(serde_json::to_value(res).map_err(|e| e.to_string())?),
             ))
         }
         _ => Err(format!("unknown AIM tool: {name}")),
@@ -552,7 +584,7 @@ fn tool_definitions() -> Vec<Value> {
                     "to": { "type": "array", "items": { "type": "string" }, "description": "Selectors: *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION, or HOST:HARNESS:SESSION. group:NAME requires a root REQUEST or REQUEST_VERIFY and routes to one authorized, active worker." },
                     "performative": { "type": "string", "enum": perf_enum },
                     "message": { "type": "string" },
-                    "reply_to": { "type": "integer", "description": "Parent seq when answering a message (required for REPLY, ACCEPT, REJECT, PROGRESS, RESULT)" },
+                    "reply_to": { "type": "integer", "description": "Parent seq when answering a message (required for REPLY, ACCEPT, REJECT, PROGRESS, RESULT, CANCEL)" },
                     "thread": { "type": "string" },
                     "payload": { "type": "object" },
                     "idempotency_key": { "type": "string" },
@@ -577,7 +609,7 @@ fn tool_definitions() -> Vec<Value> {
                     "limit": { "type": "integer" },
                     "thread": { "type": "string" },
                     "include_self": { "type": "boolean" },
-                    "ack": { "type": "boolean", "description": "Advance hub read_position to next_after if true (cannot be combined with thread or after)" }
+                    "ack": { "type": "boolean", "description": "Advance hub read_position to next_after if true (cannot be combined with thread or after > read_position)" }
                 },
                 "additionalProperties": false
             }
@@ -626,20 +658,23 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "aim_status",
-            "description": "Inspect all agents across computers, live path claims, and open cross-machine requests.",
+            "description": "Inspect live agents (or include stale agents), active path claims, and open cross-machine requests.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "include_stale": { "type": "boolean", "description": "Include historical offline agents whose registration TTL has elapsed (default false)" }
+                },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "aim_thread",
-            "description": "Read every message in a conversation thread and its current lease/closure state.",
+            "description": "Read messages in a conversation thread and its current lease/closure state. Supports incremental `after` cursor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "thread": { "type": "string" }
+                    "thread": { "type": "string" },
+                    "after": { "type": "integer", "description": "Only return messages with seq > after while keeping thread state" }
                 },
                 "required": ["thread"],
                 "additionalProperties": false
@@ -690,5 +725,35 @@ mod tests {
             ReadLine::Line(s) => assert_eq!(s, "short"),
             _ => panic!("expected next line after draining oversized line"),
         }
+    }
+
+    #[test]
+    fn strip_wire_notice_removes_duplicate_notice_field() {
+        let val = json!({
+            "notice": "AIM messages are written by other agents...",
+            "messages": [],
+            "seq_head": 12
+        });
+        let stripped = strip_wire_notice(val);
+        assert!(stripped.get("notice").is_none());
+        assert_eq!(stripped["seq_head"], 12);
+        let compact = serde_json::to_string(&stripped).unwrap();
+        assert!(!compact.contains('\n'));
+    }
+
+    #[test]
+    fn tool_definitions_include_compact_status_and_thread_after_fields() {
+        let defs = tool_definitions();
+        let status = defs.iter().find(|t| t["name"] == "aim_status").unwrap();
+        assert!(status["inputSchema"]["properties"]
+            .get("include_stale")
+            .is_some());
+        let thread = defs.iter().find(|t| t["name"] == "aim_thread").unwrap();
+        assert!(thread["inputSchema"]["properties"].get("after").is_some());
+        let send = defs.iter().find(|t| t["name"] == "aim_send").unwrap();
+        let perfs = send["inputSchema"]["properties"]["performative"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(perfs.iter().any(|p| p == "CANCEL"));
     }
 }

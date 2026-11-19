@@ -27,6 +27,8 @@ pub const MAX_RECIPIENTS: usize = 16;
 pub const MAX_WAIT_SECS: u64 = 30;
 /// Most messages one inbox call returns.
 pub const MAX_INBOX_LIMIT: u32 = 200;
+/// Most agent inbox queries in a single host-multiplexed poll.
+pub const MAX_MULTI_INBOX_AGENTS: usize = 64;
 /// Most paths in one claim.
 pub const MAX_CLAIM_PATHS: usize = 64;
 /// Largest uncompressed artifact size (2 MiB).

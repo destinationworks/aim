@@ -11,11 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum_server::tls_rustls::RustlsConfig;
-use tokio::sync::watch;
 
 use crate::auth::{AuthRateLimiter, AuthState, KeyRing};
 use crate::config::ServerConfig;
-use crate::handlers::{build_router, HubState, WaiterTracker};
+use crate::handlers::{build_router, HubState, SeqNotifier, WaiterTracker};
 use crate::store::{Store, StoreConfig};
 
 pub fn build_hub_state(cfg: &ServerConfig) -> Result<HubState, String> {
@@ -35,7 +34,7 @@ pub fn build_hub_state(cfg: &ServerConfig) -> Result<HubState, String> {
     let store = Store::open_with_keyring(&cfg.data_dir, store_cfg, keyring.clone())?;
     let limiter = AuthRateLimiter::new(cfg.auth_failures_per_minute);
     let auth = AuthState { keyring, limiter };
-    let (seq_watch, _) = watch::channel(0u64);
+    let notifier = Arc::new(SeqNotifier::new());
     let waiter_tracker = Arc::new(WaiterTracker::new(
         cfg.max_concurrent_waiters,
         cfg.max_waiters_per_host,
@@ -43,7 +42,7 @@ pub fn build_hub_state(cfg: &ServerConfig) -> Result<HubState, String> {
     Ok(HubState {
         store,
         auth,
-        seq_watch,
+        notifier,
         waiter_tracker,
     })
 }

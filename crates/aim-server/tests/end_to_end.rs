@@ -1480,3 +1480,352 @@ async fn cli_binaries_init_ca_cert_keygen_revoke_and_send_attach() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn multi_inbox_serves_multiple_agents_and_wakes_immediately() {
+    let h = start_harness().await;
+    let mac = h.client_for(&h.mac_key);
+    let wks = h.client_for(&h.wks_key);
+
+    for agent in ["codex:w1", "codex:w2"] {
+        let client = mac.clone();
+        tokio::task::spawn_blocking(move || {
+            client.register(&RegisterRequest {
+                agent: agent.into(),
+                ..RegisterRequest::default()
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    let waiter = tokio::task::spawn_blocking({
+        let client = mac.clone();
+        move || {
+            client.inbox_multi(&aim_proto::wire::MultiInboxRequest {
+                agents: vec![
+                    aim_proto::wire::MultiInboxAgentQuery {
+                        agent: "codex:w1".into(),
+                        after: Some(0),
+                        thread: None,
+                        include_self: false,
+                    },
+                    aim_proto::wire::MultiInboxAgentQuery {
+                        agent: "codex:w2".into(),
+                        after: Some(0),
+                        thread: None,
+                        include_self: false,
+                    },
+                ],
+                limit: Some(50),
+                wait_secs: Some(15),
+            })
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        wks.send(&SendRequest {
+            agent: "agy:coordinator".into(),
+            to: vec!["macbook:codex:w2".into()],
+            performative: Performative::Announce,
+            thread: None,
+            reply_to: None,
+            body: "Wake second worker via multiplexed inbox".into(),
+            payload: None,
+            idempotency_key: None,
+            expires_in_secs: None,
+            lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let resp = waiter.await.unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(resp.inboxes.len(), 2);
+    assert!(resp.inboxes[0].messages.is_empty());
+    assert_eq!(resp.inboxes[1].messages.len(), 1);
+    assert_eq!(
+        resp.inboxes[1].messages[0].body,
+        "Wake second worker via multiplexed inbox"
+    );
+}
+
+#[tokio::test]
+async fn status_live_only_and_thread_after_filter_over_https() {
+    let h = start_harness().await;
+    let mac = h.client_for(&h.mac_key);
+    let wks = h.client_for(&h.wks_key);
+
+    tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.register(&RegisterRequest {
+                agent: "agy:live".into(),
+                ..RegisterRequest::default()
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let q1 = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:live".into(),
+                to: vec!["macbook:codex:r1".into()],
+                performative: Performative::Query,
+                thread: None,
+                reply_to: None,
+                body: "First question".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let q2 = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        let thread = q1.thread.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:live".into(),
+                to: vec!["macbook:codex:r1".into()],
+                performative: Performative::Query,
+                thread: Some(thread),
+                reply_to: Some(q1.seq),
+                body: "Follow-up question".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let partial = tokio::task::spawn_blocking({
+        let client = mac.clone();
+        let thread = q1.thread.clone();
+        move || client.thread_after(&thread, Some(q1.seq))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(partial.messages.len(), 1);
+    assert_eq!(partial.messages[0].seq, q2.seq);
+
+    let caught_up = tokio::task::spawn_blocking({
+        let client = mac.clone();
+        let thread = q1.thread.clone();
+        move || client.thread_after(&thread, Some(q2.seq))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(caught_up.messages.is_empty());
+
+    let live_status = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || client.status_filtered(true)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(live_status.agents.iter().all(|a| a.live));
+    assert!(live_status
+        .agents
+        .iter()
+        .any(|a| a.id == "workstation:agy:live"));
+}
+
+#[tokio::test]
+async fn mcp_compact_json_single_notice_and_cli_watch_over_tls() {
+    let h = start_harness().await;
+    let aim_bin = aim_binary();
+    let wks = h.client_for(&h.wks_key);
+
+    let mcp_url = h.base_url.to_string();
+    let mcp_ca = h.ca_cert.clone();
+    let mcp_key = h.mac_key.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(&aim_bin)
+            .arg("mcp")
+            .env("AIM_URL", &mcp_url)
+            .env("AIM_CA_CERT", &mcp_ca)
+            .env("AIM_KEY_FILE", &mcp_key)
+            .env("AIM_AGENT", "claude:compact-1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"aim_inbox","arguments":{{}}}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"aim_inbox","arguments":{{"after":5,"ack":true}}}}}}"#).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let mut lines: Vec<serde_json::Value> = res
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    lines.sort_by_key(|v| v["id"].as_i64().unwrap_or(0));
+    let empty_content = lines[1]["result"]["content"].as_array().unwrap();
+    assert_eq!(empty_content.len(), 1);
+    let empty_text = empty_content[0]["text"].as_str().unwrap();
+    assert!(!empty_text.contains('\n'));
+    let empty_payload: serde_json::Value = serde_json::from_str(empty_text).unwrap();
+    assert!(empty_payload.get("notice").is_none());
+    assert_eq!(lines[2]["result"]["isError"], true);
+
+    tokio::task::spawn_blocking({
+        let wks = wks.clone();
+        move || {
+            wks.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["macbook:claude:compact-1".into()],
+                performative: Performative::Announce,
+                thread: None,
+                reply_to: None,
+                body: "Non-empty MCP message".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let aim_bin_msg = aim_binary();
+    let mcp_url2 = h.base_url.to_string();
+    let mcp_ca2 = h.ca_cert.clone();
+    let mcp_key2 = h.mac_key.clone();
+    let res2 = tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(&aim_bin_msg)
+            .arg("mcp")
+            .env("AIM_URL", &mcp_url2)
+            .env("AIM_CA_CERT", &mcp_ca2)
+            .env("AIM_KEY_FILE", &mcp_key2)
+            .env("AIM_AGENT", "claude:compact-1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"aim_inbox","arguments":{{"ack":true}}}}}}"#).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let mut lines2: Vec<serde_json::Value> = res2
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    lines2.sort_by_key(|v| v["id"].as_i64().unwrap_or(0));
+    let non_empty_content = lines2[1]["result"]["content"].as_array().unwrap();
+    assert_eq!(non_empty_content.len(), 2);
+    assert!(non_empty_content[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("not verified"));
+    let msg_json_text = non_empty_content[1]["text"].as_str().unwrap();
+    assert!(!msg_json_text.contains('\n'));
+    let msg_payload: serde_json::Value = serde_json::from_str(msg_json_text).unwrap();
+    assert!(msg_payload.get("notice").is_none());
+    assert_eq!(msg_payload["messages"][0]["body"], "Non-empty MCP message");
+    assert_eq!(msg_payload["read_position"], msg_payload["next_after"]);
+
+    let aim_bin2 = aim_binary();
+    let watch_base = h.base_url.to_string();
+    let watch_ca = h.ca_cert.clone();
+    let watch_key = h.mac_key.clone();
+    let watch_task = tokio::task::spawn_blocking(move || {
+        Command::new(&aim_bin2)
+            .env("AIM_URL", watch_base)
+            .env("AIM_CA_CERT", watch_ca)
+            .env("AIM_KEY_FILE", watch_key)
+            .args([
+                "--agent",
+                "codex:watcher",
+                "watch",
+                "--timeout",
+                "10",
+                "--ack",
+            ])
+            .output()
+            .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::task::spawn_blocking(move || {
+        wks.send(&SendRequest {
+            agent: "agy:sender".into(),
+            to: vec!["macbook:codex:watcher".into()],
+            performative: Performative::Announce,
+            thread: None,
+            reply_to: None,
+            body: "Watch event arrived".into(),
+            payload: None,
+            idempotency_key: None,
+            expires_in_secs: None,
+            lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let out = watch_task.await.unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let watched: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(watched["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(watched["messages"][0]["body"], "Watch event arrived");
+    assert_eq!(watched["read_position"], watched["next_after"]);
+}

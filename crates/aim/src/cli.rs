@@ -1,13 +1,14 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use aim_proto::guard::find_secret_bytes;
 use aim_proto::names::check_name;
 use aim_proto::wire::{
-    check_artifact_name, check_sha256, AckRequest, ClaimRequest, RegisterRequest, ReleaseRequest,
-    SendRequest,
+    check_artifact_name, check_sha256, AckRequest, ClaimRequest, InboxResponse, RegisterRequest,
+    ReleaseRequest, SendRequest,
 };
-use aim_proto::{Performative, MAX_ARTIFACT_RAW_BYTES};
+use aim_proto::{Performative, MAX_ARTIFACT_RAW_BYTES, MAX_INBOX_LIMIT, MAX_WAIT_SECS};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
@@ -65,16 +66,22 @@ pub enum Command {
     Send(SendArgs),
     /// Read messages addressed to this agent (supports long-poll --wait)
     Inbox(InboxArgs),
+    /// Block on a pooled connection until unread messages arrive or timeout elapses
+    Watch(WatchArgs),
     /// Advance the hub-stored read position for this agent
     Ack(AckArgs),
     /// Claim repo file or directory patterns to warn remote peers of overlaps
     Claim(ClaimArgs),
     /// Release one or all path claims held by this agent
     Release(ReleaseArgs),
-    /// Show live agents, active path claims, and open requests across all computers
-    Status,
+    /// Show agents, active path claims, and open requests across all computers
+    Status(StatusArgs),
     /// Inspect every message in a thread
-    Thread { thread: String },
+    Thread {
+        thread: String,
+        #[arg(long)]
+        after: Option<u64>,
+    },
     /// Upload or download Brotli Q6 compressed artifacts
     Artifact {
         #[command(subcommand)]
@@ -127,7 +134,7 @@ pub struct SendArgs {
     /// Recipient selector(s): *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION, HOST:HARNESS:SESSION
     #[arg(long, required = true, value_delimiter = ',')]
     pub to: Vec<String>,
-    /// Message type: ANNOUNCE, QUERY, REPLY, REQUEST, REQUEST_VERIFY, ACCEPT, REJECT, PROGRESS, RESULT, ALERT, BLOCKER, CONFLICT
+    /// Message type: ANNOUNCE, QUERY, REPLY, REQUEST, REQUEST_VERIFY, ACCEPT, REJECT, PROGRESS, RESULT, CANCEL, ALERT, BLOCKER, CONFLICT
     #[arg(long, default_value = "ANNOUNCE")]
     pub performative: String,
     /// Message text (omit when passing --stdin)
@@ -185,6 +192,32 @@ pub struct InboxArgs {
     /// Advance hub-stored read_position to next_after after reading
     #[arg(long)]
     pub ack: bool,
+}
+
+#[derive(Args)]
+pub struct WatchArgs {
+    /// Start watching after sequence number (defaults to hub-stored read_position)
+    #[arg(long)]
+    pub after: Option<u64>,
+    /// Filter to a single thread
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Total watch timeout in seconds (1-3600)
+    #[arg(long, default_value_t = 300)]
+    pub timeout: u64,
+    /// Include broadcast messages sent by this same agent
+    #[arg(long)]
+    pub include_self: bool,
+    /// Advance hub-stored read_position to next_after when messages arrive
+    #[arg(long)]
+    pub ack: bool,
+}
+
+#[derive(Args)]
+pub struct StatusArgs {
+    /// Return only live agents whose registration TTL has not expired
+    #[arg(long)]
+    pub live_only: bool,
 }
 
 #[derive(Args)]
@@ -369,10 +402,9 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             print_json(&res, pretty)?;
         }
         Command::Inbox(args) => {
-            if args.ack && (args.thread.is_some() || args.after.is_some()) {
+            if args.ack && args.thread.is_some() {
                 return Err(
-                    "--ack cannot be combined with --thread or --after (would skip unread messages)"
-                        .into(),
+                    "--ack cannot be combined with --thread (would skip unread messages)".into(),
                 );
             }
             let agent = cfg.resolve_agent(agent_arg)?;
@@ -384,14 +416,25 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                 args.thread.as_deref(),
                 args.include_self,
             )?;
-            if args.ack && res.next_after > res.read_position {
-                let acked = client.ack(&AckRequest {
-                    agent,
-                    read_to: res.next_after,
-                })?;
-                res.read_position = acked.read_position;
+            if args.ack {
+                if args.after.is_some_and(|cursor| cursor > res.read_position) {
+                    return Err(
+                        "--ack with --after > read_position would skip unread messages; omit --after or run `aim ack` explicitly"
+                            .into(),
+                    );
+                }
+                if res.next_after > res.read_position {
+                    let acked = client.ack(&AckRequest {
+                        agent,
+                        read_to: res.next_after,
+                    })?;
+                    res.read_position = acked.read_position;
+                }
             }
             print_json(&res, pretty)?;
+        }
+        Command::Watch(args) => {
+            return run_watch(&cfg, &client, agent_arg, args, pretty);
         }
         Command::Ack(args) => {
             let agent = cfg.resolve_agent(agent_arg)?;
@@ -427,13 +470,13 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             })?;
             print_json(&res, pretty)?;
         }
-        Command::Status => {
-            let res = client.status()?;
+        Command::Status(args) => {
+            let res = client.status_filtered(args.live_only)?;
             print_json(&res, pretty)?;
         }
-        Command::Thread { thread } => {
+        Command::Thread { thread, after } => {
             check_name("thread", &thread)?;
-            let res = client.thread(&thread)?;
+            let res = client.thread_after(&thread, after)?;
             print_json(&res, pretty)?;
         }
         Command::Artifact { action } => match action {
@@ -578,4 +621,85 @@ fn print_json<T: serde::Serialize>(val: &T, pretty: bool) -> Result<(), String> 
     .map_err(|e| e.to_string())?;
     println!("{out}");
     Ok(())
+}
+
+fn run_watch(
+    cfg: &ResolvedConfig,
+    client: &AimClient,
+    agent_arg: Option<&str>,
+    args: WatchArgs,
+    pretty: bool,
+) -> Result<i32, String> {
+    if args.ack && args.thread.is_some() {
+        return Err("--ack cannot be combined with --thread (would skip unread messages)".into());
+    }
+    if let Some(ref t) = args.thread {
+        check_name("thread", t)?;
+    }
+    let agent = cfg.resolve_agent(agent_arg)?;
+    let total_timeout = Duration::from_secs(args.timeout.clamp(1, 3600));
+    let deadline = Instant::now() + total_timeout;
+    let mut scan_after = args.after;
+    let mut error_backoff = Duration::from_secs(1);
+    let mut last_empty: Option<InboxResponse> = None;
+    let mut last_err: Option<String> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.as_secs().min(MAX_WAIT_SECS);
+        match client.inbox(
+            &agent,
+            scan_after,
+            Some(wait),
+            Some(MAX_INBOX_LIMIT),
+            args.thread.as_deref(),
+            args.include_self,
+        ) {
+            Ok(mut res) => {
+                error_backoff = Duration::from_secs(1);
+                if args.ack && args.after.is_some_and(|cursor| cursor > res.read_position) {
+                    return Err(
+                        "--ack with --after > read_position would skip unread messages; omit --after or run `aim ack` explicitly"
+                            .into(),
+                    );
+                }
+                if !res.messages.is_empty() {
+                    if args.ack && res.next_after > res.read_position {
+                        let acked = client.ack(&AckRequest {
+                            agent,
+                            read_to: res.next_after,
+                        })?;
+                        res.read_position = acked.read_position;
+                    }
+                    print_json(&res, pretty)?;
+                    return Ok(0);
+                }
+                if args.thread.is_none() && res.next_after > 0 {
+                    scan_after =
+                        Some(scan_after.map_or(res.next_after, |prev| prev.max(res.next_after)));
+                }
+                last_empty = Some(res);
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            Err(err) => {
+                last_err = Some(err);
+                let sleep_for =
+                    error_backoff.min(deadline.saturating_duration_since(Instant::now()));
+                if sleep_for.is_zero() {
+                    break;
+                }
+                std::thread::sleep(sleep_for);
+                error_backoff = (error_backoff * 2).min(Duration::from_secs(8));
+            }
+        }
+    }
+
+    if let Some(empty) = last_empty {
+        print_json(&empty, pretty)?;
+        Ok(0)
+    } else {
+        Err(last_err.unwrap_or_else(|| "AIM watch timed out".into()))
+    }
 }

@@ -6,8 +6,9 @@ use aim_proto::guard::find_secret_bytes;
 use aim_proto::names::{check_name, sanitize_display};
 use aim_proto::wire::{
     check_artifact_name, check_sha256, AckRequest, AckResponse, ArtifactInfo, ClaimRequest,
-    ClaimResponse, HealthResponse, InboxResponse, RegisterRequest, RegisterResponse,
-    ReleaseRequest, SendRequest, SendResponse, StatusResponse, ThreadResponse,
+    ClaimResponse, HealthResponse, InboxResponse, MultiInboxRequest, MultiInboxResponse,
+    RegisterRequest, RegisterResponse, ReleaseRequest, SendRequest, SendResponse, StatusResponse,
+    ThreadResponse,
 };
 use aim_proto::{MAX_ARTIFACT_BR_BYTES, MAX_WAIT_SECS};
 use serde::de::DeserializeOwned;
@@ -132,6 +133,27 @@ impl AimClient {
         parse_json_response(resp)
     }
 
+    pub fn inbox_multi(&self, req: &MultiInboxRequest) -> Result<MultiInboxResponse, String> {
+        req.validate()?;
+        let url = self.endpoint("/v1/inbox/multi")?;
+        let call_timeout = req
+            .wait_secs
+            .map(|w| Duration::from_secs(w.min(MAX_WAIT_SECS) + 10))
+            .unwrap_or(self.timeout)
+            .max(self.timeout);
+        let auth = self.key.bearer_header();
+        let resp = self
+            .agent
+            .post(url.as_str())
+            .header("Authorization", auth.as_str())
+            .config()
+            .timeout_global(Some(call_timeout))
+            .build()
+            .send_json(req)
+            .map_err(|e| format!("HTTPS multi-inbox request failed: {e}"))?;
+        parse_json_response(resp)
+    }
+
     pub fn ack(&self, req: &AckRequest) -> Result<AckResponse, String> {
         req.validate()?;
         self.post_json("/v1/ack", req)
@@ -148,7 +170,14 @@ impl AimClient {
     }
 
     pub fn status(&self) -> Result<StatusResponse, String> {
-        let url = self.endpoint("/v1/status")?;
+        self.status_filtered(false)
+    }
+
+    pub fn status_filtered(&self, live_only: bool) -> Result<StatusResponse, String> {
+        let mut url = self.endpoint("/v1/status")?;
+        if live_only {
+            url.query_pairs_mut().append_pair("live_only", "true");
+        }
         let auth = self.key.bearer_header();
         let resp = self
             .agent
@@ -160,8 +189,20 @@ impl AimClient {
     }
 
     pub fn thread(&self, thread: &str) -> Result<ThreadResponse, String> {
+        self.thread_after(thread, None)
+    }
+
+    pub fn thread_after(&self, thread: &str, after: Option<u64>) -> Result<ThreadResponse, String> {
         check_name("thread", thread)?;
-        let url = self.endpoint(&format!("/v1/thread/{thread}"))?;
+        if let Some(a) = after {
+            if i64::try_from(a).is_err() {
+                return Err("after sequence number is out of range".into());
+            }
+        }
+        let mut url = self.endpoint(&format!("/v1/thread/{thread}"))?;
+        if let Some(a) = after {
+            url.query_pairs_mut().append_pair("after", &a.to_string());
+        }
         let auth = self.key.bearer_header();
         let resp = self
             .agent
