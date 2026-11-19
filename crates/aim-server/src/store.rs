@@ -1140,6 +1140,20 @@ impl Store {
                     }
                     _ => {}
                 }
+            } else if parent_perf == Performative::Query {
+                if closed != 0 {
+                    return Err(StoreError::Conflict(format!(
+                        "query seq {parent_seq_u64} is already closed"
+                    )));
+                }
+                if req.performative == Performative::Cancel {
+                    if parent_sender != sender_str {
+                        return Err(StoreError::Conflict(
+                            "only the original sender may CANCEL a request or query".into(),
+                        ));
+                    }
+                    tx.execute("UPDATE messages SET closed=1 WHERE seq=?1", [parent_seq])?;
+                }
             } else if req.performative == Performative::Cancel {
                 if parent_sender != sender_str {
                     return Err(StoreError::Conflict(
@@ -2968,5 +2982,71 @@ mod schema_tests {
             .unwrap()
             .open_requests
             .is_empty());
+    }
+
+    #[test]
+    fn cancelled_query_rejects_subsequent_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("data"), StoreConfig::default()).unwrap();
+        let (query, _) = store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Query,
+                    thread: None,
+                    reply_to: None,
+                    body: "Still relevant?".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: Some(3600),
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Cancel,
+                    thread: Some(query.thread.clone()),
+                    reply_to: Some(query.seq),
+                    body: "Never mind".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.send(
+                "mac",
+                SendRequest {
+                    agent: "codex:worker".into(),
+                    to: vec!["workstation:agy:requester".into()],
+                    performative: Performative::Reply,
+                    thread: Some(query.thread),
+                    reply_to: Some(query.seq),
+                    body: "Late reply".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            ),
+            Err(StoreError::Conflict(msg)) if msg.contains("already closed")
+        ));
     }
 }

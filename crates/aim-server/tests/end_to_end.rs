@@ -1235,13 +1235,11 @@ fn aim_binary() -> PathBuf {
     BIN.get_or_init(|| {
         let srv_bin = PathBuf::from(env!("CARGO_BIN_EXE_aim-server"));
         let aim_bin = srv_bin.with_file_name(if cfg!(windows) { "aim.exe" } else { "aim" });
-        if !aim_bin.exists() {
-            let status = Command::new(env!("CARGO"))
-                .args(["build", "-p", "aim", "--bin", "aim", "--locked"])
-                .status()
-                .expect("failed invoking cargo build --bin aim");
-            assert!(status.success(), "cargo build --bin aim failed");
-        }
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "aim", "--bin", "aim", "--locked"])
+            .status()
+            .expect("failed invoking cargo build --bin aim");
+        assert!(status.success(), "cargo build --bin aim failed");
         assert!(
             aim_bin.exists(),
             "expected built aim binary at {}",
@@ -1828,4 +1826,172 @@ async fn mcp_compact_json_single_notice_and_cli_watch_over_tls() {
     assert_eq!(watched["messages"].as_array().unwrap().len(), 1);
     assert_eq!(watched["messages"][0]["body"], "Watch event arrived");
     assert_eq!(watched["read_position"], watched["next_after"]);
+}
+
+#[tokio::test]
+async fn version_cli_http_and_mcp_work_end_to_end() {
+    let h = start_harness().await;
+    let srv_bin = PathBuf::from(env!("CARGO_BIN_EXE_aim-server"));
+    let aim_bin = aim_binary();
+
+    // 1. Disabled/revoked key fails with 401 on authenticated /v1/version.
+    let revoked = h.client_for(&h.disabled_key);
+    let unauth = tokio::task::spawn_blocking(move || revoked.hub_version())
+        .await
+        .unwrap();
+    assert!(unauth.unwrap_err().contains("401"));
+
+    // 2. Authenticated hub_version() returns hub BuildInfo without target.
+    let client = h.client_for(&h.mac_key);
+    let hub_info = tokio::task::spawn_blocking(move || client.hub_version())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("current test hub should expose /v1/version");
+    assert_eq!(hub_info.version, aim_proto::PKG_VERSION);
+    assert_eq!(hub_info.build_version, aim_proto::BUILD_VERSION);
+    assert_eq!(hub_info.git_sha, aim_proto::GIT_SHA);
+    assert_eq!(hub_info.protocol, PROTOCOL);
+    assert_eq!(hub_info.target, None);
+    assert!(hub_info.features.iter().any(|f| f == "version_info"));
+
+    // 3. CLI `--version`, offline `aim version`, `aim version --hub`, `aim-server version`, and MCP `aim_version`.
+    let base_url = h.base_url.to_string();
+    let ca_cert = h.ca_cert.clone();
+    let wks_key = h.wks_key.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent_cfg = dir.path().join("missing.toml");
+
+        let aim_ver_flag = Command::new(&aim_bin).arg("--version").output().unwrap();
+        assert!(aim_ver_flag.status.success());
+        assert!(String::from_utf8_lossy(&aim_ver_flag.stdout).contains(aim_proto::BUILD_VERSION));
+
+        let srv_ver_flag = Command::new(&srv_bin).arg("--version").output().unwrap();
+        assert!(srv_ver_flag.status.success());
+        assert!(String::from_utf8_lossy(&srv_ver_flag.stdout).contains(aim_proto::BUILD_VERSION));
+
+        let aim_ver_offline = Command::new(&aim_bin)
+            .args([
+                "--config",
+                &nonexistent_cfg.display().to_string(),
+                "version",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            aim_ver_offline.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&aim_ver_offline.stderr)
+        );
+        let offline_json: serde_json::Value =
+            serde_json::from_slice(&aim_ver_offline.stdout).unwrap();
+        assert_eq!(offline_json["client"]["git_sha"], aim_proto::GIT_SHA);
+        assert_eq!(offline_json["client"]["version"], aim_proto::PKG_VERSION);
+        assert!(offline_json.get("hub").is_none());
+
+        let aim_ver_hub = Command::new(&aim_bin)
+            .env("AIM_CONFIG", &nonexistent_cfg)
+            .env("AIM_URL", &base_url)
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &wks_key)
+            .args(["version", "--hub"])
+            .output()
+            .unwrap();
+        assert!(
+            aim_ver_hub.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&aim_ver_hub.stderr)
+        );
+        let hub_json: serde_json::Value = serde_json::from_slice(&aim_ver_hub.stdout).unwrap();
+        assert_eq!(hub_json["client"]["git_sha"], aim_proto::GIT_SHA);
+        assert_eq!(hub_json["hub"]["git_sha"], aim_proto::GIT_SHA);
+        assert_eq!(hub_json["hub"]["status"], "ok");
+        assert_eq!(hub_json["hub"]["version_supported"], true);
+
+        let srv_ver_cmd = Command::new(&srv_bin).arg("version").output().unwrap();
+        assert!(srv_ver_cmd.status.success());
+        let srv_json: serde_json::Value = serde_json::from_slice(&srv_ver_cmd.stdout).unwrap();
+        assert_eq!(srv_json["git_sha"], aim_proto::GIT_SHA);
+        assert_eq!(srv_json["version"], aim_proto::PKG_VERSION);
+        assert!(srv_json["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "version_info"));
+
+        let mut child = Command::new(&aim_bin)
+            .arg("mcp")
+            .env("AIM_CONFIG", &nonexistent_cfg)
+            .env("AIM_URL", &base_url)
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &wks_key)
+            .env("AIM_AGENT", "workstation:claude:ver-test")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"aim_version","arguments":{{}}}}}}"#).unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"aim_version","arguments":{{"include_hub":false}}}}}}"#).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout_text = String::from_utf8(out.stdout).unwrap();
+        let mut lines: Vec<serde_json::Value> = stdout_text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 4);
+        lines.sort_by_key(|v| v["id"].as_i64().unwrap_or(0));
+
+        assert_eq!(lines[0]["result"]["serverInfo"]["version"], aim_proto::BUILD_VERSION);
+        assert!(lines[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "aim_version"));
+
+        assert_eq!(lines[2]["result"]["isError"], false);
+        let ver_with_hub: serde_json::Value =
+            serde_json::from_str(lines[2]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(ver_with_hub["client"]["git_sha"], aim_proto::GIT_SHA);
+        assert_eq!(ver_with_hub["mcp"]["mode"], "pull");
+        assert_eq!(ver_with_hub["mcp"]["binary_replaced_on_disk"], false);
+        assert!(ver_with_hub["mcp"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "aim_version"));
+        assert_eq!(ver_with_hub["hub"]["git_sha"], aim_proto::GIT_SHA);
+        assert_eq!(ver_with_hub["hub"]["version_supported"], true);
+        let features = ver_with_hub["client"]["features"].as_array().unwrap();
+        for expected in ["version_info", "multi_inbox", "cancel", "watch", "compact_mcp"] {
+            assert!(
+                features.iter().any(|f| f == expected),
+                "missing feature {expected}"
+            );
+        }
+
+        assert_eq!(lines[3]["result"]["isError"], false);
+        let ver_no_hub: serde_json::Value =
+            serde_json::from_str(lines[3]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(ver_no_hub["client"]["git_sha"], aim_proto::GIT_SHA);
+        assert!(ver_no_hub.get("hub").is_none());
+    })
+    .await
+    .unwrap();
 }

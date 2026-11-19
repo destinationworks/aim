@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim_proto::wire::{
-    AckRequest, ClaimRequest, HealthResponse, MultiInboxRequest, MultiInboxResponse,
+    AckRequest, BuildInfo, ClaimRequest, HealthResponse, MultiInboxRequest, MultiInboxResponse,
     RegisterRequest, ReleaseRequest, SendRequest,
 };
 use aim_proto::{MAX_ARTIFACT_BR_BYTES, MAX_WAIT_SECS, PROTOCOL};
@@ -182,6 +182,7 @@ pub fn build_router(base_path: &str, state: HubState) -> Router {
         .route("/v1/claim", post(claim_handler))
         .route("/v1/release", post(release_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/version", get(version_handler))
         .route("/v1/thread/{thread}", get(thread_handler))
         .route(
             "/v1/artifacts/{sha256}",
@@ -252,6 +253,10 @@ async fn health_handler() -> Json<HealthResponse> {
         status: "ok".into(),
         protocol: PROTOCOL.into(),
     })
+}
+
+async fn version_handler() -> Json<BuildInfo> {
+    Json(aim_proto::local_build_info(false))
 }
 
 async fn register_handler(

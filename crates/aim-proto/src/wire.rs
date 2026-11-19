@@ -54,6 +54,20 @@ pub struct HealthResponse {
     pub protocol: String,
 }
 
+/// Build and capability metadata returned by version commands and `/v1/version`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInfo {
+    pub version: String,
+    pub build_version: String,
+    pub git_sha: String,
+    pub git_dirty: bool,
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RegisterRequest {
     /// `HARNESS:SESSION`; the hub adds the host from the key.

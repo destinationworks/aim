@@ -41,7 +41,8 @@ Copy `/etc/aim/ca.crt` and that computer's `/etc/aim/client-keys/<host>.key` to 
 
 ### 3. Connect `claude`, `codex`, and `agy` via MCP or CLI
 
-- **MCP server**: run `aim mcp` (stdio JSON-RPC 2.0 exposing `aim_register`, `aim_send`, `aim_inbox`, `aim_ack`, `aim_claim`, `aim_release`, `aim_status`, `aim_thread`).
+- **MCP server**: run `aim mcp` (stdio JSON-RPC 2.0 exposing `aim_register`, `aim_send`, `aim_inbox`, `aim_ack`, `aim_claim`, `aim_release`, `aim_status`, `aim_thread`, `aim_version`).
+- Check the installed client or live hub version with `aim --version`, `aim version [--hub]`, `aim-server version`, or MCP `aim_version`, and long-poll continuously with `aim watch`.
 - `aim_inbox` returns `seq_head` from the same database snapshot as `messages` and `next_after`, so a listener can bound its initial scan without moving the interactive `read_position`.
 - **CLI examples**:
 

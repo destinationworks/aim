@@ -5,14 +5,15 @@ use aim_proto::artifact::{compress_q6, decompress_verified};
 use aim_proto::guard::find_secret_bytes;
 use aim_proto::names::{check_name, sanitize_display};
 use aim_proto::wire::{
-    check_artifact_name, check_sha256, AckRequest, AckResponse, ArtifactInfo, ClaimRequest,
-    ClaimResponse, HealthResponse, InboxResponse, MultiInboxRequest, MultiInboxResponse,
-    RegisterRequest, RegisterResponse, ReleaseRequest, SendRequest, SendResponse, StatusResponse,
-    ThreadResponse,
+    check_artifact_name, check_sha256, AckRequest, AckResponse, ArtifactInfo, BuildInfo,
+    ClaimRequest, ClaimResponse, HealthResponse, InboxResponse, MultiInboxRequest,
+    MultiInboxResponse, RegisterRequest, RegisterResponse, ReleaseRequest, SendRequest,
+    SendResponse, StatusResponse, ThreadResponse,
 };
 use aim_proto::{MAX_ARTIFACT_BR_BYTES, MAX_WAIT_SECS};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::{json, Value};
 use ureq::config::Config;
 use ureq::http::Response;
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
@@ -69,6 +70,50 @@ impl AimClient {
             .call()
             .map_err(|e| format!("HTTPS request failed: {e}"))?;
         parse_json_response(resp)
+    }
+
+    /// Query authenticated `/v1/version`; returns `Ok(None)` on older hubs returning 404.
+    pub fn hub_version(&self) -> Result<Option<BuildInfo>, String> {
+        let url = self.endpoint("/v1/version")?;
+        let auth = self.key.bearer_header();
+        let resp = self
+            .agent
+            .get(url.as_str())
+            .header("Authorization", auth.as_str())
+            .call()
+            .map_err(|e| format!("HTTPS version request failed: {e}"))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        parse_json_response(resp).map(Some)
+    }
+
+    /// Probe hub version metadata with `/v1/health` fallback for older hubs.
+    pub fn probe_hub_version(&self) -> (Option<Value>, Option<String>) {
+        match self.hub_version() {
+            Ok(Some(info)) => match serde_json::to_value(info) {
+                Ok(mut val) => {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("status".into(), Value::String("ok".into()));
+                        obj.insert("version_supported".into(), Value::Bool(true));
+                    }
+                    (Some(val), None)
+                }
+                Err(e) => (None, Some(e.to_string())),
+            },
+            Ok(None) => match self.health() {
+                Ok(h) => (
+                    Some(json!({
+                        "status": h.status,
+                        "protocol": h.protocol,
+                        "version_supported": false,
+                    })),
+                    None,
+                ),
+                Err(e) => (None, Some(e)),
+            },
+            Err(e) => (None, Some(e)),
+        }
     }
 
     pub fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse, String> {

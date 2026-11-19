@@ -17,10 +17,11 @@ Based on agent communication languages (KQML, FIPA-ACL), distributed causal orde
 3. **Pinned TLS**:
    - `aim` requires `https://`, refuses redirects (`max_redirects = 0`), disables ambient proxies, and validates the server certificate solely against AIM's configured private CA (`ca.crt`).
 4. **Typed Performatives & Loop Prevention**:
-   - Messages carry a `performative`: `ANNOUNCE`, `QUERY`, `REPLY`, `REQUEST`, `REQUEST_VERIFY`, `ACCEPT`, `REJECT`, `PROGRESS`, `RESULT`, `ALERT`, `BLOCKER`, `CONFLICT`.
+   - Messages carry a `performative`: `ANNOUNCE`, `QUERY`, `REPLY`, `REQUEST`, `REQUEST_VERIFY`, `ACCEPT`, `REJECT`, `PROGRESS`, `RESULT`, `CANCEL`, `ALERT`, `BLOCKER`, `CONFLICT`.
    - `ANNOUNCE` cannot be answered with `REPLY`.
-   - `RESULT` closes a request; only a new `REQUEST` or `REQUEST_VERIFY` may follow it.
-   - Replies (`REPLY`, `ACCEPT`, `REJECT`, `PROGRESS`, `RESULT`) require `reply_to`, must stay in the parent's `thread`, and cannot inject into unrelated threads.
+   - `RESULT` and `CANCEL` are terminal for a request or query; only a new `REQUEST` or `REQUEST_VERIFY` may follow them.
+   - Replies (`REPLY`, `ACCEPT`, `REJECT`, `PROGRESS`, `RESULT`, `CANCEL`) require `reply_to`, must stay in the parent's `thread`, and cannot inject into unrelated threads.
+   - Only the original sender may `CANCEL` an open request or query; original requesters may also post non-leasing `PROGRESS` updates.
 5. **Exclusive Acceptance Leases**:
    - `ACCEPT` and `PROGRESS` acquire or renew a timed acceptance lease (`accepted_by`, `accept_expires_ms`) on the parent request.
    - While a lease is active, another agent's `ACCEPT`, `PROGRESS`, `REJECT`, or `RESULT` is rejected with `409 Conflict`.
@@ -82,13 +83,15 @@ An `idempotency_key` is unique to the host-bound sender while its message remain
 | Method & Path | Auth | Description |
 | :--- | :--- | :--- |
 | `GET /aim/v1/health` | None | Minimal `{"status":"ok","protocol":"aim/v1"}` reachability check |
+| `GET /aim/v1/version` | Bearer | Return hub build version, git SHA, protocol, and supported features |
 | `POST /aim/v1/register` | Bearer | Register/heartbeat agent, return hub `read_position` and active repo claims |
 | `POST /aim/v1/send` | Bearer | Send a typed message with idempotency, FSM, host visibility, lease checks, and optional one-member group assignment |
 | `GET /aim/v1/inbox` | Bearer | Read matching messages (`agent`, `after`, `wait`, `limit`, `thread`, `include_self`) |
+| `POST /aim/v1/inbox/multi` | Bearer | Host-multiplexed inbox query for up to 64 local agents on one long-poll connection |
 | `POST /aim/v1/ack` | Bearer | Monotonically advance hub-stored `read_position` (clamped to `seq_head`) |
 | `POST /aim/v1/claim` | Bearer | Record normalized path claims with TTL and report overlaps |
 | `POST /aim/v1/release` | Bearer | Release one or all claims held by an agent |
-| `GET /aim/v1/status` | Bearer | Cluster snapshot: agents, live claims, and host-visible open requests |
-| `GET /aim/v1/thread/{thread}` | Bearer | Read active messages and lease state for an authorized thread |
+| `GET /aim/v1/status` | Bearer | Cluster snapshot: agents (optional `?live_only=true`), live claims, and host-visible open requests |
+| `GET /aim/v1/thread/{thread}` | Bearer | Read active messages (`?after=N` optional) and lease state for an authorized thread |
 | `PUT /aim/v1/artifacts/{sha256}` | Bearer | Upload Brotli Q6 blob verified against SHA-256 and secret guard |
 | `GET /aim/v1/artifacts/{sha256}` | Bearer | Download authorized artifact (pass `?encoding=br` for Brotli Q6 wire transfer) |

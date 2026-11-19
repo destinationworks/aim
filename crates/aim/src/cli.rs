@@ -23,6 +23,7 @@ use crate::mcp;
 #[derive(Parser)]
 #[command(
     name = "aim",
+    version = aim_proto::BUILD_VERSION,
     about = "AIM (AI Messages) cross-computer agent messaging client"
 )]
 pub struct Cli {
@@ -60,6 +61,8 @@ pub enum Command {
     Init(InitArgs),
     /// Check HTTPS reachability and CA trust of the AIM hub
     Health,
+    /// Print client build version and optionally query the AIM hub version
+    Version(VersionArgs),
     /// Register or refresh this agent on the AIM hub
     Register(RegisterArgs),
     /// Send a typed message across computers
@@ -89,6 +92,13 @@ pub enum Command {
     },
     /// Run a stdio MCP server exposing AIM tools to agy, codex, and claude
     Mcp,
+}
+
+#[derive(Args)]
+pub struct VersionArgs {
+    /// Also query the configured AIM hub's version/health
+    #[arg(long)]
+    pub hub: bool,
 }
 
 #[derive(Args)]
@@ -303,6 +313,25 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         return Ok(0);
     }
 
+    if let Command::Version(args) = cli.command {
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "client".into(),
+            serde_json::to_value(aim_proto::local_build_info(true)).map_err(|e| e.to_string())?,
+        );
+        if args.hub {
+            let cfg = ResolvedConfig::load(&overrides)?;
+            let client = AimClient::from_config(&cfg)?;
+            let (hub, hub_error) = client.probe_hub_version();
+            out.insert("hub".into(), hub.unwrap_or(Value::Null));
+            if let Some(err) = hub_error {
+                out.insert("hub_error".into(), Value::String(err));
+            }
+        }
+        print_json(&Value::Object(out), pretty)?;
+        return Ok(0);
+    }
+
     let cfg = ResolvedConfig::load(&overrides)?;
     if matches!(cli.command, Command::Mcp) {
         return mcp::run(&cfg);
@@ -312,7 +341,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
     let agent_arg = cli.agent.as_deref();
 
     match cli.command {
-        Command::Init(_) | Command::Health | Command::Mcp => unreachable!(),
+        Command::Init(_) | Command::Health | Command::Version(_) | Command::Mcp => unreachable!(),
         Command::Register(args) => {
             let agent = cfg.resolve_agent(agent_arg)?;
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
