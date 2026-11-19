@@ -7,7 +7,7 @@ use crate::address::{AgentId, Selector};
 use crate::guard::{check_fields, check_json_value};
 use crate::names::{check_name, check_text, is_forbidden_unicode};
 use crate::performative::Performative;
-use crate::{MAX_BODY, MAX_CLAIM_PATHS, MAX_PAYLOAD, MAX_RECIPIENTS};
+use crate::{MAX_BODY, MAX_CLAIM_PATHS, MAX_MULTI_INBOX_AGENTS, MAX_PAYLOAD, MAX_RECIPIENTS};
 
 /// Longest a message may be kept before it expires: 30 days.
 pub const MAX_EXPIRY_SECS: u64 = 30 * 24 * 3600;
@@ -52,6 +52,20 @@ pub fn check_artifact_name(name: &str) -> Result<(), String> {
 pub struct HealthResponse {
     pub status: String,
     pub protocol: String,
+}
+
+/// Build and capability metadata returned by version commands and `/v1/version`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInfo {
+    pub version: String,
+    pub build_version: String,
+    pub git_sha: String,
+    pub git_dirty: bool,
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -317,6 +331,7 @@ pub struct Message {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InboxResponse {
+    #[serde(default)]
     pub notice: String,
     pub messages: Vec<Message>,
     /// Highest stored message sequence in this SQLite read snapshot.
@@ -327,6 +342,65 @@ pub struct InboxResponse {
     pub next_after: u64,
     /// The read position stored on the hub for this agent.
     pub read_position: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiInboxAgentQuery {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    #[serde(default)]
+    pub include_self: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiInboxRequest {
+    pub agents: Vec<MultiInboxAgentQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_secs: Option<u64>,
+}
+
+impl MultiInboxRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.agents.is_empty() || self.agents.len() > MAX_MULTI_INBOX_AGENTS {
+            return Err(format!("name 1-{MAX_MULTI_INBOX_AGENTS} agents"));
+        }
+        for entry in &self.agents {
+            AgentId::validate_identity(&entry.agent)?;
+            if let Some(after) = entry.after {
+                if i64::try_from(after).is_err() {
+                    return Err("after sequence number is out of range".into());
+                }
+            }
+            if let Some(thread) = &entry.thread {
+                check_name("thread", thread)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiInboxEntry {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    pub messages: Vec<Message>,
+    pub seq_head: u64,
+    pub next_after: u64,
+    pub read_position: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiInboxResponse {
+    #[serde(default)]
+    pub notice: String,
+    pub seq_head: u64,
+    pub inboxes: Vec<MultiInboxEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -703,5 +777,73 @@ mod tests {
             assert!(!paths_overlap(a, b), "{a} vs {b}");
             assert!(!paths_overlap(b, a), "{b} vs {a}");
         }
+    }
+
+    #[test]
+    fn multi_inbox_validation() {
+        let empty = MultiInboxRequest {
+            agents: Vec::new(),
+            limit: None,
+            wait_secs: None,
+        };
+        assert!(empty.validate().is_err());
+
+        let too_many = MultiInboxRequest {
+            agents: (0..=MAX_MULTI_INBOX_AGENTS)
+                .map(|idx| MultiInboxAgentQuery {
+                    agent: format!("codex:s{idx}"),
+                    after: None,
+                    thread: None,
+                    include_self: false,
+                })
+                .collect(),
+            limit: None,
+            wait_secs: None,
+        };
+        assert!(too_many.validate().is_err());
+
+        let bad_after = MultiInboxRequest {
+            agents: vec![MultiInboxAgentQuery {
+                agent: "lubuntu:codex:s1".into(),
+                after: Some(u64::MAX),
+                thread: None,
+                include_self: false,
+            }],
+            limit: None,
+            wait_secs: None,
+        };
+        assert!(bad_after.validate().is_err());
+
+        let bad_thread = MultiInboxRequest {
+            agents: vec![MultiInboxAgentQuery {
+                agent: "codex:s1".into(),
+                after: Some(5),
+                thread: Some("bad thread".into()),
+                include_self: false,
+            }],
+            limit: None,
+            wait_secs: None,
+        };
+        assert!(bad_thread.validate().is_err());
+
+        let valid = MultiInboxRequest {
+            agents: vec![
+                MultiInboxAgentQuery {
+                    agent: "lubuntu:codex:s1".into(),
+                    after: Some(5),
+                    thread: Some("thr-1".into()),
+                    include_self: true,
+                },
+                MultiInboxAgentQuery {
+                    agent: "codex:s2".into(),
+                    after: None,
+                    thread: None,
+                    include_self: false,
+                },
+            ],
+            limit: Some(50),
+            wait_secs: Some(10),
+        };
+        assert!(valid.validate().is_ok());
     }
 }

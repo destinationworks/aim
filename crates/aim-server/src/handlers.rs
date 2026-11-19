@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim_proto::wire::{
-    AckRequest, ClaimRequest, HealthResponse, RegisterRequest, ReleaseRequest, SendRequest,
+    AckRequest, BuildInfo, ClaimRequest, HealthResponse, MultiInboxRequest, MultiInboxResponse,
+    RegisterRequest, ReleaseRequest, SendRequest,
 };
 use aim_proto::{MAX_ARTIFACT_BR_BYTES, MAX_WAIT_SECS, PROTOCOL};
 use axum::body::Bytes;
@@ -21,7 +22,7 @@ use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
 
 use crate::auth::{require_bearer, AuthState, AuthenticatedHost};
-use crate::store::{Store, StoreError};
+use crate::store::{SendNotify, Store, StoreError};
 
 pub struct WaiterTracker {
     max_concurrent: usize,
@@ -87,11 +88,71 @@ impl Drop for WaiterGuard {
     }
 }
 
+pub struct SeqNotifier {
+    broadcast: watch::Sender<u64>,
+    by_host: Mutex<HashMap<String, watch::Sender<u64>>>,
+}
+
+impl Default for SeqNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SeqNotifier {
+    pub fn new() -> Self {
+        let (broadcast, _) = watch::channel(0u64);
+        Self {
+            broadcast,
+            by_host: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn subscribe(&self, host: &str) -> (watch::Receiver<u64>, watch::Receiver<u64>) {
+        let broadcast_rx = self.broadcast.subscribe();
+        let host_rx = match self.by_host.lock() {
+            Ok(mut map) => {
+                if map.len() > 64 {
+                    map.retain(|_, sender| sender.receiver_count() > 0);
+                }
+                map.entry(host.to_string())
+                    .or_insert_with(|| watch::channel(0u64).0)
+                    .subscribe()
+            }
+            Err(_) => self.broadcast.subscribe(),
+        };
+        (broadcast_rx, host_rx)
+    }
+
+    pub fn notify(&self, event: &SendNotify) {
+        match &event.target_hosts {
+            None => {
+                let _ = self.broadcast.send(event.seq);
+            }
+            Some(hosts) => {
+                let targets: Vec<watch::Sender<u64>> = self
+                    .by_host
+                    .lock()
+                    .map(|map| {
+                        hosts
+                            .iter()
+                            .filter_map(|host| map.get(host).cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for sender in targets {
+                    let _ = sender.send(event.seq);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HubState {
     pub store: Store,
     pub auth: AuthState,
-    pub seq_watch: watch::Sender<u64>,
+    pub notifier: Arc<SeqNotifier>,
     pub waiter_tracker: Arc<WaiterTracker>,
 }
 
@@ -116,10 +177,12 @@ pub fn build_router(base_path: &str, state: HubState) -> Router {
         .route("/v1/register", post(register_handler))
         .route("/v1/send", post(send_handler))
         .route("/v1/inbox", get(inbox_handler))
+        .route("/v1/inbox/multi", post(inbox_multi_handler))
         .route("/v1/ack", post(ack_handler))
         .route("/v1/claim", post(claim_handler))
         .route("/v1/release", post(release_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/version", get(version_handler))
         .route("/v1/thread/{thread}", get(thread_handler))
         .route(
             "/v1/artifacts/{sha256}",
@@ -192,6 +255,10 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
+async fn version_handler() -> Json<BuildInfo> {
+    Json(aim_proto::local_build_info(false))
+}
+
 async fn register_handler(
     State(state): State<HubState>,
     Extension(AuthenticatedHost(host)): Extension<AuthenticatedHost>,
@@ -208,9 +275,9 @@ async fn send_handler(
     Json(req): Json<SendRequest>,
 ) -> Result<Json<aim_proto::wire::SendResponse>, ApiError> {
     let store = state.store.clone();
-    let (res, new_seq) = blocking(move || store.send(&host, req)).await?;
-    if let Some(seq) = new_seq {
-        let _ = state.seq_watch.send(seq);
+    let (res, notify) = blocking(move || store.send(&host, req)).await?;
+    if let Some(event) = notify {
+        state.notifier.notify(&event);
     }
     Ok(Json(res))
 }
@@ -238,6 +305,14 @@ async fn run_query(
         .await
 }
 
+async fn run_multi_query(
+    store: Store,
+    host: String,
+    req: MultiInboxRequest,
+) -> Result<MultiInboxResponse, ApiError> {
+    blocking(move || store.inbox_multi(&host, &req)).await
+}
+
 async fn inbox_handler(
     State(state): State<HubState>,
     Extension(AuthenticatedHost(host)): Extension<AuthenticatedHost>,
@@ -245,8 +320,9 @@ async fn inbox_handler(
 ) -> Result<Json<aim_proto::wire::InboxResponse>, ApiError> {
     let wait_secs = q.wait.unwrap_or(0).min(MAX_WAIT_SECS);
     let include_self = q.include_self.unwrap_or(false);
-    let mut rx = state.seq_watch.subscribe();
-    rx.borrow_and_update();
+    let (mut broadcast_rx, mut host_rx) = state.notifier.subscribe(&host);
+    broadcast_rx.borrow_and_update();
+    host_rx.borrow_and_update();
 
     let first = run_query(
         state.store.clone(),
@@ -270,11 +346,20 @@ async fn inbox_handler(
 
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     let mut latest = first;
-    let mut scan_after = q.after;
+    let mut scan_after = if q.thread.is_none() && latest.next_after > 0 {
+        Some(latest.next_after)
+    } else {
+        q.after
+    };
 
     loop {
         tokio::select! {
-            changed = rx.changed() => {
+            changed = broadcast_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            changed = host_rx.changed() => {
                 if changed.is_err() {
                     break;
                 }
@@ -296,8 +381,72 @@ async fn inbox_handler(
         if !latest.messages.is_empty() {
             break;
         }
-        if latest.next_after > 0 {
+        if q.thread.is_none() && latest.next_after > 0 {
             scan_after = Some(latest.next_after);
+        }
+    }
+    Ok(Json(latest))
+}
+
+async fn inbox_multi_handler(
+    State(state): State<HubState>,
+    Extension(AuthenticatedHost(host)): Extension<AuthenticatedHost>,
+    Json(req): Json<MultiInboxRequest>,
+) -> Result<Json<MultiInboxResponse>, ApiError> {
+    req.validate()
+        .map_err(|e| ApiError(StoreError::BadRequest(e)))?;
+    let wait_secs = req.wait_secs.unwrap_or(0).min(MAX_WAIT_SECS);
+    let (mut broadcast_rx, mut host_rx) = state.notifier.subscribe(&host);
+    broadcast_rx.borrow_and_update();
+    host_rx.borrow_and_update();
+
+    let first = run_multi_query(state.store.clone(), host.clone(), req.clone()).await?;
+    if first.inboxes.iter().any(|entry| !entry.messages.is_empty()) || wait_secs == 0 {
+        return Ok(Json(first));
+    }
+
+    let _waiter_guard = state
+        .waiter_tracker
+        .try_acquire(&host)
+        .map_err(|e| ApiError(StoreError::QuotaExceeded(e)))?;
+
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    let mut latest = first;
+    let mut scan_req = req;
+    for (entry, query) in latest.inboxes.iter().zip(scan_req.agents.iter_mut()) {
+        if query.thread.is_none() && entry.next_after > 0 {
+            query.after = Some(entry.next_after);
+        }
+    }
+
+    loop {
+        tokio::select! {
+            changed = broadcast_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            changed = host_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            _ = sleep_until(deadline) => {
+                break;
+            }
+        }
+        latest = run_multi_query(state.store.clone(), host.clone(), scan_req.clone()).await?;
+        if latest
+            .inboxes
+            .iter()
+            .any(|entry| !entry.messages.is_empty())
+        {
+            break;
+        }
+        for (entry, query) in latest.inboxes.iter().zip(scan_req.agents.iter_mut()) {
+            if query.thread.is_none() && entry.next_after > 0 {
+                query.after = Some(entry.next_after);
+            }
         }
     }
     Ok(Json(latest))
@@ -333,22 +482,35 @@ async fn release_handler(
     Ok(Json(json!({ "released": released })))
 }
 
+#[derive(Deserialize)]
+pub struct StatusQuery {
+    pub live_only: Option<bool>,
+}
+
 async fn status_handler(
     State(state): State<HubState>,
     Extension(AuthenticatedHost(host)): Extension<AuthenticatedHost>,
+    Query(q): Query<StatusQuery>,
 ) -> Result<Json<aim_proto::wire::StatusResponse>, ApiError> {
+    let live_only = q.live_only.unwrap_or(false);
     let store = state.store.clone();
-    let res = blocking(move || store.status(&host)).await?;
+    let res = blocking(move || store.status_filtered(&host, live_only)).await?;
     Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+pub struct ThreadQuery {
+    pub after: Option<u64>,
 }
 
 async fn thread_handler(
     State(state): State<HubState>,
     Extension(AuthenticatedHost(host)): Extension<AuthenticatedHost>,
     Path(thread): Path<String>,
+    Query(q): Query<ThreadQuery>,
 ) -> Result<Json<aim_proto::wire::ThreadResponse>, ApiError> {
     let store = state.store.clone();
-    let res = blocking(move || store.thread(&host, &thread)).await?;
+    let res = blocking(move || store.thread_after(&host, &thread, q.after)).await?;
     Ok(Json(res))
 }
 
@@ -426,4 +588,34 @@ async fn get_artifact_handler(
         resp.headers_mut().insert(CONTENT_DISPOSITION, val);
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partitioned_notifier_wakes_only_target_host() {
+        let notifier = SeqNotifier::new();
+        let (b1, mut mac_rx) = notifier.subscribe("mac");
+        let (b2, win_rx) = notifier.subscribe("win");
+        assert!(!b1.has_changed().unwrap());
+        assert!(!b2.has_changed().unwrap());
+
+        notifier.notify(&SendNotify {
+            seq: 10,
+            target_hosts: Some(vec!["mac".into()]),
+        });
+        assert!(mac_rx.has_changed().unwrap());
+        assert_eq!(*mac_rx.borrow_and_update(), 10);
+        assert!(!win_rx.has_changed().unwrap());
+        assert!(!b1.has_changed().unwrap());
+
+        notifier.notify(&SendNotify {
+            seq: 11,
+            target_hosts: None,
+        });
+        assert!(b1.has_changed().unwrap());
+        assert!(b2.has_changed().unwrap());
+    }
 }

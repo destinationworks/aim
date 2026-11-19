@@ -5,13 +5,15 @@ use aim_proto::artifact::{compress_q6, decompress_verified};
 use aim_proto::guard::find_secret_bytes;
 use aim_proto::names::{check_name, sanitize_display};
 use aim_proto::wire::{
-    check_artifact_name, check_sha256, AckRequest, AckResponse, ArtifactInfo, ClaimRequest,
-    ClaimResponse, HealthResponse, InboxResponse, RegisterRequest, RegisterResponse,
-    ReleaseRequest, SendRequest, SendResponse, StatusResponse, ThreadResponse,
+    check_artifact_name, check_sha256, AckRequest, AckResponse, ArtifactInfo, BuildInfo,
+    ClaimRequest, ClaimResponse, HealthResponse, InboxResponse, MultiInboxRequest,
+    MultiInboxResponse, RegisterRequest, RegisterResponse, ReleaseRequest, SendRequest,
+    SendResponse, StatusResponse, ThreadResponse,
 };
 use aim_proto::{MAX_ARTIFACT_BR_BYTES, MAX_WAIT_SECS};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::{json, Value};
 use ureq::config::Config;
 use ureq::http::Response;
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
@@ -68,6 +70,50 @@ impl AimClient {
             .call()
             .map_err(|e| format!("HTTPS request failed: {e}"))?;
         parse_json_response(resp)
+    }
+
+    /// Query authenticated `/v1/version`; returns `Ok(None)` on older hubs returning 404.
+    pub fn hub_version(&self) -> Result<Option<BuildInfo>, String> {
+        let url = self.endpoint("/v1/version")?;
+        let auth = self.key.bearer_header();
+        let resp = self
+            .agent
+            .get(url.as_str())
+            .header("Authorization", auth.as_str())
+            .call()
+            .map_err(|e| format!("HTTPS version request failed: {e}"))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        parse_json_response(resp).map(Some)
+    }
+
+    /// Probe hub version metadata with `/v1/health` fallback for older hubs.
+    pub fn probe_hub_version(&self) -> (Option<Value>, Option<String>) {
+        match self.hub_version() {
+            Ok(Some(info)) => match serde_json::to_value(info) {
+                Ok(mut val) => {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("status".into(), Value::String("ok".into()));
+                        obj.insert("version_supported".into(), Value::Bool(true));
+                    }
+                    (Some(val), None)
+                }
+                Err(e) => (None, Some(e.to_string())),
+            },
+            Ok(None) => match self.health() {
+                Ok(h) => (
+                    Some(json!({
+                        "status": h.status,
+                        "protocol": h.protocol,
+                        "version_supported": false,
+                    })),
+                    None,
+                ),
+                Err(e) => (None, Some(e)),
+            },
+            Err(e) => (None, Some(e)),
+        }
     }
 
     pub fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse, String> {
@@ -132,6 +178,27 @@ impl AimClient {
         parse_json_response(resp)
     }
 
+    pub fn inbox_multi(&self, req: &MultiInboxRequest) -> Result<MultiInboxResponse, String> {
+        req.validate()?;
+        let url = self.endpoint("/v1/inbox/multi")?;
+        let call_timeout = req
+            .wait_secs
+            .map(|w| Duration::from_secs(w.min(MAX_WAIT_SECS) + 10))
+            .unwrap_or(self.timeout)
+            .max(self.timeout);
+        let auth = self.key.bearer_header();
+        let resp = self
+            .agent
+            .post(url.as_str())
+            .header("Authorization", auth.as_str())
+            .config()
+            .timeout_global(Some(call_timeout))
+            .build()
+            .send_json(req)
+            .map_err(|e| format!("HTTPS multi-inbox request failed: {e}"))?;
+        parse_json_response(resp)
+    }
+
     pub fn ack(&self, req: &AckRequest) -> Result<AckResponse, String> {
         req.validate()?;
         self.post_json("/v1/ack", req)
@@ -148,7 +215,14 @@ impl AimClient {
     }
 
     pub fn status(&self) -> Result<StatusResponse, String> {
-        let url = self.endpoint("/v1/status")?;
+        self.status_filtered(false)
+    }
+
+    pub fn status_filtered(&self, live_only: bool) -> Result<StatusResponse, String> {
+        let mut url = self.endpoint("/v1/status")?;
+        if live_only {
+            url.query_pairs_mut().append_pair("live_only", "true");
+        }
         let auth = self.key.bearer_header();
         let resp = self
             .agent
@@ -160,8 +234,20 @@ impl AimClient {
     }
 
     pub fn thread(&self, thread: &str) -> Result<ThreadResponse, String> {
+        self.thread_after(thread, None)
+    }
+
+    pub fn thread_after(&self, thread: &str, after: Option<u64>) -> Result<ThreadResponse, String> {
         check_name("thread", thread)?;
-        let url = self.endpoint(&format!("/v1/thread/{thread}"))?;
+        if let Some(a) = after {
+            if i64::try_from(a).is_err() {
+                return Err("after sequence number is out of range".into());
+            }
+        }
+        let mut url = self.endpoint(&format!("/v1/thread/{thread}"))?;
+        if let Some(a) = after {
+            url.query_pairs_mut().append_pair("after", &a.to_string());
+        }
         let auth = self.key.bearer_header();
         let resp = self
             .agent

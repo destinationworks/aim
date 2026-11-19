@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,9 +10,9 @@ use aim_proto::guard::find_secret_bytes;
 use aim_proto::names::check_name;
 use aim_proto::wire::{
     check_artifact_name, check_sha256, paths_overlap, AckRequest, AckResponse, AgentInfo,
-    ArtifactInfo, ClaimInfo, ClaimRequest, ClaimResponse, InboxResponse, Message, OpenRequest,
-    RegisterRequest, RegisterResponse, ReleaseRequest, SendRequest, SendResponse, StatusResponse,
-    ThreadResponse, MAX_EXPIRY_SECS,
+    ArtifactInfo, ClaimInfo, ClaimRequest, ClaimResponse, InboxResponse, Message, MultiInboxEntry,
+    MultiInboxRequest, MultiInboxResponse, OpenRequest, RegisterRequest, RegisterResponse,
+    ReleaseRequest, SendRequest, SendResponse, StatusResponse, ThreadResponse, MAX_EXPIRY_SECS,
 };
 use aim_proto::{Performative, MAX_ARTIFACT_BR_BYTES, MAX_INBOX_LIMIT, UNTRUSTED_NOTICE};
 use rand::RngCore;
@@ -138,6 +139,13 @@ impl<'a> Drop for PooledConn<'a> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendNotify {
+    pub seq: u64,
+    /// `None` wakes all host subscribers; `Some(hosts)` wakes only listed hosts.
+    pub target_hosts: Option<Vec<String>>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -146,6 +154,13 @@ pub struct Store {
     artifact_io_lock: Arc<Mutex<()>>,
     cfg: StoreConfig,
     keyring: Option<crate::auth::KeyRing>,
+}
+
+struct CachedAgentMeta {
+    repo: Option<String>,
+    caps: Vec<String>,
+    read_position: u64,
+    seen_ms: Option<i64>,
 }
 
 struct ExistingSendRequest {
@@ -236,6 +251,101 @@ fn ensure_assignment_columns(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot index group assignments: {e}"))?;
     Ok(())
+}
+
+fn ensure_recipient_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS message_recipients (
+             seq INTEGER NOT NULL,
+             selector TEXT NOT NULL,
+             PRIMARY KEY (seq, selector),
+             FOREIGN KEY (seq) REFERENCES messages(seq) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_message_recipients_selector_seq
+             ON message_recipients(selector, seq);",
+    )
+    .map_err(|e| format!("cannot initialize recipient index: {e}"))?;
+
+    let mut missing_rows = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, to_json FROM messages
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM message_recipients mr WHERE mr.seq = messages.seq
+                 )",
+            )
+            .map_err(|e| format!("cannot inspect unindexed messages: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("cannot query unindexed messages: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("cannot read unindexed message row: {e}"))?
+        {
+            let seq: i64 = row
+                .get(0)
+                .map_err(|e| format!("cannot read unindexed message seq: {e}"))?;
+            let to_json: String = row
+                .get(1)
+                .map_err(|e| format!("cannot read unindexed message recipients: {e}"))?;
+            missing_rows.push((seq, to_json));
+        }
+    }
+
+    if !missing_rows.is_empty() {
+        let mut insert = conn
+            .prepare("INSERT OR IGNORE INTO message_recipients(seq, selector) VALUES(?1, ?2)")
+            .map_err(|e| format!("cannot prepare recipient backfill: {e}"))?;
+        for (seq, to_json) in missing_rows {
+            let recipients: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
+            for raw in recipients {
+                if let Ok(sel) = Selector::parse(&raw) {
+                    insert
+                        .execute(params![seq, sel.to_string()])
+                        .map_err(|e| format!("cannot backfill recipient index: {e}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_message_recipients(
+    tx: &rusqlite::Transaction<'_>,
+    seq: i64,
+    to: &[String],
+) -> Result<(), StoreError> {
+    let mut stmt =
+        tx.prepare("INSERT OR IGNORE INTO message_recipients(seq, selector) VALUES(?1, ?2)")?;
+    for raw in to {
+        if let Ok(sel) = Selector::parse(raw) {
+            stmt.execute(params![seq, sel.to_string()])?;
+        }
+    }
+    Ok(())
+}
+
+fn notify_targets(to: &[String]) -> Option<Vec<String>> {
+    let mut hosts = Vec::new();
+    for raw in to {
+        let Ok(sel) = Selector::parse(raw) else {
+            return None;
+        };
+        let host = match sel {
+            Selector::Host(h) => h,
+            Selector::Agent(id) => id.host,
+            _ => return None,
+        };
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    if hosts.is_empty() {
+        None
+    } else {
+        Some(hosts)
+    }
 }
 
 fn send_request_fingerprint(request: &SendRequest) -> Result<String, StoreError> {
@@ -369,6 +479,15 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_messages_expires
                 ON messages(expires_ms);
 
+            CREATE TABLE IF NOT EXISTS message_recipients (
+                seq INTEGER NOT NULL,
+                selector TEXT NOT NULL,
+                PRIMARY KEY (seq, selector),
+                FOREIGN KEY (seq) REFERENCES messages(seq) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_recipients_selector_seq
+                ON message_recipients(selector, seq);
+
             CREATE TABLE IF NOT EXISTS claims (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent TEXT NOT NULL,
@@ -408,6 +527,7 @@ impl Store {
         )
         .map_err(|e| format!("failed initializing schema: {e}"))?;
         ensure_assignment_columns(&conn)?;
+        ensure_recipient_index(&conn)?;
 
         let read_pool = Arc::new(ReadPool::new(db_path, 4));
         Ok(Self {
@@ -547,7 +667,7 @@ impl Store {
         &self,
         host: &str,
         mut req: SendRequest,
-    ) -> Result<(SendResponse, Option<u64>), StoreError> {
+    ) -> Result<(SendResponse, Option<SendNotify>), StoreError> {
         let selectors = req.validate().map_err(StoreError::BadRequest)?;
         let request_fingerprint = req
             .idempotency_key
@@ -911,6 +1031,24 @@ impl Store {
             }
 
             if parent_perf.is_request() {
+                if closed != 0 {
+                    return Err(StoreError::Conflict(format!(
+                        "request seq {parent_seq_u64} is already closed"
+                    )));
+                }
+                let sender_is_direct_recipient = parent_assigned_to.as_deref()
+                    == Some(sender_str.as_str())
+                    || (parent_assigned_group.is_none()
+                        && serde_json::from_str::<Vec<String>>(&parent_to_json)
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|raw| {
+                                Selector::parse(raw)
+                                    .is_ok_and(|sel| sel.is_direct_match(&sender_id))
+                            }));
+                let sender_requester_progress = req.performative == Performative::Progress
+                    && parent_sender == sender_str
+                    && !sender_is_direct_recipient;
                 if parent_assigned_group.is_some()
                     && matches!(
                         req.performative,
@@ -919,16 +1057,17 @@ impl Store {
                             | Performative::Progress
                             | Performative::Result
                     )
+                    && !sender_requester_progress
                     && parent_assigned_to.as_deref() != Some(sender_str.as_str())
                 {
                     return Err(StoreError::Conflict(
                         "group task controls are limited to the persisted assignee".into(),
                     ));
                 }
-                if closed != 0 {
-                    return Err(StoreError::Conflict(format!(
-                        "request seq {parent_seq_u64} is already closed"
-                    )));
+                if sender_requester_progress && req.lease_secs.is_some() {
+                    return Err(StoreError::BadRequest(
+                        "original requester cannot set lease_secs on own request".into(),
+                    ));
                 }
                 let lease_ms = req
                     .lease_secs
@@ -951,15 +1090,17 @@ impl Store {
                         )?;
                     }
                     Performative::Progress => {
-                        if let Some(holder) = active_holder {
-                            return Err(StoreError::Conflict(format!(
-                                "request seq {parent_seq_u64} is accepted by {holder}"
-                            )));
+                        if !sender_requester_progress {
+                            if let Some(holder) = active_holder {
+                                return Err(StoreError::Conflict(format!(
+                                    "request seq {parent_seq_u64} is accepted by {holder}"
+                                )));
+                            }
+                            tx.execute(
+                                "UPDATE messages SET accepted_by=?1, accept_expires_ms=?2 WHERE seq=?3",
+                                params![&sender_str, now.saturating_add(lease_ms), parent_seq],
+                            )?;
                         }
-                        tx.execute(
-                            "UPDATE messages SET accepted_by=?1, accept_expires_ms=?2 WHERE seq=?3",
-                            params![&sender_str, now.saturating_add(lease_ms), parent_seq],
-                        )?;
                     }
                     Performative::Reject => {
                         if let Some(holder) = active_holder {
@@ -986,8 +1127,45 @@ impl Store {
                             params![&sender_str, parent_seq],
                         )?;
                     }
+                    Performative::Cancel => {
+                        if parent_sender != sender_str {
+                            return Err(StoreError::Conflict(
+                                "only the original sender may CANCEL a request or query".into(),
+                            ));
+                        }
+                        tx.execute(
+                            "UPDATE messages SET closed=1, accept_expires_ms=NULL WHERE seq=?1",
+                            [parent_seq],
+                        )?;
+                    }
                     _ => {}
                 }
+            } else if parent_perf == Performative::Query {
+                if closed != 0 {
+                    return Err(StoreError::Conflict(format!(
+                        "query seq {parent_seq_u64} is already closed"
+                    )));
+                }
+                if req.performative == Performative::Cancel {
+                    if parent_sender != sender_str {
+                        return Err(StoreError::Conflict(
+                            "only the original sender may CANCEL a request or query".into(),
+                        ));
+                    }
+                    tx.execute("UPDATE messages SET closed=1 WHERE seq=?1", [parent_seq])?;
+                }
+            } else if req.performative == Performative::Cancel {
+                if parent_sender != sender_str {
+                    return Err(StoreError::Conflict(
+                        "only the original sender may CANCEL a request or query".into(),
+                    ));
+                }
+                if closed != 0 {
+                    return Err(StoreError::Conflict(format!(
+                        "query seq {parent_seq_u64} is already closed"
+                    )));
+                }
+                tx.execute("UPDATE messages SET closed=1 WHERE seq=?1", [parent_seq])?;
             }
             parent_thread
         } else {
@@ -1060,6 +1238,8 @@ impl Store {
             ],
         )?;
         let seq = tx.last_insert_rowid() as u64;
+        insert_message_recipients(&tx, seq as i64, &req.to)?;
+        let target_hosts = notify_targets(&req.to);
         tx.commit()?;
 
         Ok((
@@ -1074,7 +1254,7 @@ impl Store {
                 assigned_role,
                 not_before_ms,
             },
-            Some(seq),
+            Some(SendNotify { seq, target_hosts }),
         ))
     }
 
@@ -1105,27 +1285,10 @@ impl Store {
         let tx = db.unchecked_transaction()?;
 
         let agent_str = agent_id.to_string();
-        let agent_meta: Option<(Option<String>, String, i64, i64)> = tx
-            .query_row(
-                "SELECT repo, caps_json, read_position, seen_ms FROM agents WHERE id=?1",
-                [&agent_str],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let (repo, caps, read_position, seen_ms) = match agent_meta {
-            Some((repo, caps_json, rp, seen_ms)) => {
-                let caps: Vec<String> = serde_json::from_str(&caps_json).unwrap_or_default();
-                (repo, caps, rp.max(0) as u64, Some(seen_ms))
-            }
-            None => (None, Vec::new(), 0, None),
-        };
-        let recipient = Recipient {
-            id: &agent_id,
-            repo: repo.as_deref(),
-            caps: &caps,
-        };
+        let meta = Self::lookup_agent_meta(&tx, &agent_str)?;
+        let read_position = meta.read_position;
+        let seen_ms = meta.seen_ms;
 
-        let effective_after = after_i64.unwrap_or(read_position as i64);
         // Read the boundary and recipient-visible messages from the same
         // SQLite snapshot. A send committed after this snapshot is established
         // is deferred to the next request and cannot be skipped by a persisted
@@ -1136,26 +1299,232 @@ impl Store {
             })?;
         let seq_head = seq_head.max(0) as u64;
 
-        let mut messages = Vec::new();
-        let mut hit_limit = false;
+        let (messages, next_after) = Self::inbox_in_tx(
+            &tx,
+            &agent_id,
+            &meta,
+            after_i64,
+            max_rows,
+            thread,
+            include_self,
+            now,
+            seq_head,
+        )?;
+
+        tx.commit()?;
+        drop(db);
+
+        self.refresh_stale_agents(vec![(agent_str, seen_ms)], now)?;
+
+        Ok(InboxResponse {
+            notice: UNTRUSTED_NOTICE.to_string(),
+            messages,
+            seq_head,
+            next_after,
+            read_position,
+        })
+    }
+
+    pub fn inbox_multi(
+        &self,
+        host: &str,
+        req: &MultiInboxRequest,
+    ) -> Result<MultiInboxResponse, StoreError> {
+        req.validate().map_err(StoreError::BadRequest)?;
+        let max_rows = req.limit.unwrap_or(100).clamp(1, MAX_INBOX_LIMIT) as usize;
+        let now = now_ms();
+
+        struct ResolvedQuery<'a> {
+            id: AgentId,
+            id_str: String,
+            raw_agent: &'a str,
+            after_i64: Option<i64>,
+            thread: Option<&'a str>,
+            include_self: bool,
+        }
+
+        let mut resolved = Vec::with_capacity(req.agents.len());
+        for q in &req.agents {
+            let id = AgentId::from_local(host, &q.agent).map_err(StoreError::BadRequest)?;
+            let id_str = id.to_string();
+            let after_i64 = match q.after {
+                Some(v) => Some(
+                    i64::try_from(v)
+                        .map_err(|_| StoreError::BadRequest("after out of range".into()))?,
+                ),
+                None => None,
+            };
+            resolved.push(ResolvedQuery {
+                id,
+                id_str,
+                raw_agent: q.agent.as_str(),
+                after_i64,
+                thread: q.thread.as_deref(),
+                include_self: q.include_self,
+            });
+        }
+
+        let db = self.read_pool.acquire()?;
+        let tx = db.unchecked_transaction()?;
+
+        let seq_head: i64 =
+            tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |r| {
+                r.get(0)
+            })?;
+        let seq_head = seq_head.max(0) as u64;
+
+        let mut meta_cache: HashMap<String, CachedAgentMeta> = HashMap::new();
+        let mut stale_candidates = Vec::new();
+        let mut inboxes = Vec::with_capacity(resolved.len());
+
+        for q in &resolved {
+            if !meta_cache.contains_key(&q.id_str) {
+                let meta = Self::lookup_agent_meta(&tx, &q.id_str)?;
+                stale_candidates.push((q.id_str.clone(), meta.seen_ms));
+                meta_cache.insert(q.id_str.clone(), meta);
+            }
+            let meta = &meta_cache[&q.id_str];
+            let (messages, next_after) = Self::inbox_in_tx(
+                &tx,
+                &q.id,
+                meta,
+                q.after_i64,
+                max_rows,
+                q.thread,
+                q.include_self,
+                now,
+                seq_head,
+            )?;
+            inboxes.push(MultiInboxEntry {
+                agent: q.raw_agent.to_string(),
+                thread: q.thread.map(str::to_string),
+                messages,
+                seq_head,
+                next_after,
+                read_position: meta.read_position,
+            });
+        }
+
+        tx.commit()?;
+        drop(db);
+
+        self.refresh_stale_agents(stale_candidates, now)?;
+
+        Ok(MultiInboxResponse {
+            notice: UNTRUSTED_NOTICE.to_string(),
+            seq_head,
+            inboxes,
+        })
+    }
+
+    fn lookup_agent_meta(
+        tx: &rusqlite::Transaction<'_>,
+        agent_str: &str,
+    ) -> Result<CachedAgentMeta, StoreError> {
+        let row: Option<(Option<String>, String, i64, i64)> = tx
+            .query_row(
+                "SELECT repo, caps_json, read_position, seen_ms FROM agents WHERE id=?1",
+                [agent_str],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((repo, caps_json, rp, seen_ms)) => {
+                let caps: Vec<String> = serde_json::from_str(&caps_json).unwrap_or_default();
+                CachedAgentMeta {
+                    repo,
+                    caps,
+                    read_position: rp.max(0) as u64,
+                    seen_ms: Some(seen_ms),
+                }
+            }
+            None => CachedAgentMeta {
+                repo: None,
+                caps: Vec::new(),
+                read_position: 0,
+                seen_ms: None,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inbox_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        agent_id: &AgentId,
+        meta: &CachedAgentMeta,
+        after_i64: Option<i64>,
+        max_rows: usize,
+        thread: Option<&str>,
+        include_self: bool,
+        now: i64,
+        seq_head: u64,
+    ) -> Result<(Vec<Message>, u64), StoreError> {
+        use rusqlite::types::Value as SqlValue;
+
+        let recipient = Recipient {
+            id: agent_id,
+            repo: meta.repo.as_deref(),
+            caps: &meta.caps,
+        };
+        let effective_after = after_i64.unwrap_or(meta.read_position as i64);
+
+        let mut candidate_selectors = vec![
+            "*".to_string(),
+            format!("host:{}", agent_id.host),
+            format!("harness:{}", agent_id.harness),
+            agent_id.to_string(),
+            agent_id.session.clone(),
+        ];
+        if let Some(ref repo) = meta.repo {
+            candidate_selectors.push(format!("repo:{repo}"));
+        }
+        for cap in &meta.caps {
+            candidate_selectors.push(format!("cap:{cap}"));
+        }
+
+        let start_idx = if thread.is_some() { 4 } else { 3 };
+        let placeholders = (0..candidate_selectors.len())
+            .map(|offset| format!("?{}", start_idx + offset))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let sql = if thread.is_some() {
-            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json,
-                    assigned_group, task_category, assigned_role, not_before_ms
-             FROM messages WHERE seq > ?1 AND expires_ms > ?2 AND thread = ?3 ORDER BY seq ASC"
+            format!(
+                "SELECT m.seq, m.msg_id, m.created_ms, m.expires_ms, m.sender, m.to_json, m.performative, m.thread, m.reply_to, m.body, m.payload_json,
+                        m.assigned_group, m.task_category, m.assigned_role, m.not_before_ms
+                 FROM messages m
+                 WHERE m.thread = ?3 AND m.seq > ?1 AND m.expires_ms > ?2
+                   AND EXISTS (
+                       SELECT 1 FROM message_recipients mr
+                       WHERE mr.seq = m.seq AND mr.selector IN ({placeholders})
+                   )
+                 ORDER BY m.seq ASC"
+            )
         } else {
-            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json,
-                    assigned_group, task_category, assigned_role, not_before_ms
-             FROM messages WHERE seq > ?1 AND expires_ms > ?2 ORDER BY seq ASC"
+            format!(
+                "SELECT DISTINCT m.seq, m.msg_id, m.created_ms, m.expires_ms, m.sender, m.to_json, m.performative, m.thread, m.reply_to, m.body, m.payload_json,
+                        m.assigned_group, m.task_category, m.assigned_role, m.not_before_ms
+                 FROM message_recipients mr
+                 JOIN messages m ON m.seq = mr.seq
+                 WHERE mr.selector IN ({placeholders}) AND mr.seq > ?1 AND m.expires_ms > ?2
+                 ORDER BY m.seq ASC"
+            )
         };
 
-        let mut stmt = tx.prepare(sql)?;
-        let mut rows = if let Some(t) = thread {
-            stmt.query(params![effective_after, now, t])?
-        } else {
-            stmt.query(params![effective_after, now])?
-        };
+        let mut sql_params: Vec<SqlValue> = Vec::with_capacity(3 + candidate_selectors.len());
+        sql_params.push(SqlValue::Integer(effective_after));
+        sql_params.push(SqlValue::Integer(now));
+        if let Some(t) = thread {
+            sql_params.push(SqlValue::Text(t.to_string()));
+        }
+        for sel in candidate_selectors {
+            sql_params.push(SqlValue::Text(sel));
+        }
 
+        let mut messages = Vec::new();
+        let mut hit_limit = false;
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(sql_params))?;
         while let Some(row) = rows.next()? {
             let sender: String = row.get(4)?;
             let Ok(sender_id) = AgentId::parse_full(&sender) else {
@@ -1172,8 +1541,7 @@ impl Store {
                     hit_limit = true;
                     break;
                 }
-                let msg = decode_message_row(row)?;
-                messages.push(msg);
+                messages.push(decode_message_row(row)?);
             }
         }
         drop(rows);
@@ -1188,27 +1556,40 @@ impl Store {
             last_seq
         };
 
-        tx.commit()?;
+        Ok((messages, next_after))
+    }
 
-        // Refresh presence after the read snapshot is closed. This endpoint is
-        // the listener heartbeat, throttled to a fraction of the agent TTL.
+    fn refresh_stale_agents(
+        &self,
+        candidates: Vec<(String, Option<i64>)>,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        // Refresh presence after read snapshots close. Authenticated inbox reads
+        // act as listener heartbeats, throttled to a fraction of the TTL.
         let heartbeat_cutoff = now.saturating_sub((self.cfg.agent_ttl_ms / 3).clamp(1, 60_000));
-        if seen_ms.is_some_and(|seen| seen <= heartbeat_cutoff) {
-            self.conn
-                .lock()
-                .map_err(|_| StoreError::Internal("db lock poisoned".into()))?
-                .execute(
-                    "UPDATE agents SET seen_ms=?2 WHERE id=?1 AND seen_ms<=?3",
-                    params![agent_str, now, heartbeat_cutoff],
-                )?;
+        let mut due_ids = HashSet::new();
+        for (id, seen_ms) in candidates {
+            if seen_ms.is_some_and(|seen| seen <= heartbeat_cutoff) {
+                due_ids.insert(id);
+            }
         }
-        Ok(InboxResponse {
-            notice: UNTRUSTED_NOTICE.to_string(),
-            messages,
-            seq_head,
-            next_after,
-            read_position,
-        })
+        if due_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut db = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Internal("db lock poisoned".into()))?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for id in due_ids {
+            tx.execute(
+                "UPDATE agents SET seen_ms=?2 WHERE id=?1 AND seen_ms<=?3",
+                params![id, now, heartbeat_cutoff],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn ack(&self, host: &str, req: AckRequest) -> Result<AckResponse, StoreError> {
@@ -1408,6 +1789,14 @@ impl Store {
     }
 
     pub fn status(&self, caller_host: &str) -> Result<StatusResponse, StoreError> {
+        self.status_filtered(caller_host, false)
+    }
+
+    pub fn status_filtered(
+        &self,
+        caller_host: &str,
+        live_only: bool,
+    ) -> Result<StatusResponse, StoreError> {
         let now = now_ms();
         let cutoff = now.saturating_sub(self.cfg.agent_ttl_ms);
         let db = self.read_pool.acquire()?;
@@ -1419,11 +1808,19 @@ impl Store {
 
         let mut agents = Vec::new();
         {
-            let mut stmt = db.prepare(
+            let sql = if live_only {
                 "SELECT id, host, harness, session, repo, worktree, branch, head, caps_json, note, seen_ms
-                 FROM agents ORDER BY seen_ms DESC LIMIT 200",
-            )?;
-            let mut rows = stmt.query([])?;
+                 FROM agents WHERE seen_ms >= ?1 ORDER BY seen_ms DESC LIMIT 200"
+            } else {
+                "SELECT id, host, harness, session, repo, worktree, branch, head, caps_json, note, seen_ms
+                 FROM agents ORDER BY seen_ms DESC LIMIT 200"
+            };
+            let mut stmt = db.prepare(sql)?;
+            let mut rows = if live_only {
+                stmt.query([cutoff])?
+            } else {
+                stmt.query([])?
+            };
             while let Some(row) = rows.next()? {
                 let caps_json: String = row.get(8)?;
                 let caps: Vec<String> = serde_json::from_str(&caps_json).unwrap_or_default();
@@ -1521,7 +1918,21 @@ impl Store {
     }
 
     pub fn thread(&self, caller_host: &str, thread: &str) -> Result<ThreadResponse, StoreError> {
+        self.thread_after(caller_host, thread, None)
+    }
+
+    pub fn thread_after(
+        &self,
+        caller_host: &str,
+        thread: &str,
+        after: Option<u64>,
+    ) -> Result<ThreadResponse, StoreError> {
         check_name("thread", thread).map_err(StoreError::BadRequest)?;
+        if let Some(cursor) = after {
+            if i64::try_from(cursor).is_err() {
+                return Err(StoreError::BadRequest("after out of range".into()));
+            }
+        }
         let now = now_ms();
         let db = self.read_pool.acquire()?;
 
@@ -1530,13 +1941,16 @@ impl Store {
         let mut accept_expires_ms = None;
         let mut closed = false;
         let mut caller_is_authorized = false;
+        let mut truncated = false;
 
-        // Query up to 201 messages to detect truncation
+        // Scan unexpired rows in chronological order so thread existence, host
+        // authorization, and request lease/closure state remain accurate even
+        // when `after` skips earlier messages.
         let mut stmt = db.prepare(
             "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json,
                     assigned_group, task_category, assigned_role, not_before_ms,
                     accepted_by, accept_expires_ms, closed
-             FROM messages WHERE thread=?1 AND expires_ms > ?2 ORDER BY seq ASC LIMIT 201",
+             FROM messages WHERE thread=?1 AND expires_ms > ?2 ORDER BY seq ASC",
         )?;
         let mut rows = stmt.query(params![thread, now])?;
         while let Some(row) = rows.next()? {
@@ -1558,18 +1972,19 @@ impl Store {
                     accepted_by.as_ref().and(ae)
                 };
             }
-            messages.push(msg);
+            if after.is_none_or(|cursor| msg.seq > cursor) {
+                if messages.len() >= 200 {
+                    truncated = true;
+                } else {
+                    messages.push(msg);
+                }
+            }
         }
         drop(rows);
         drop(stmt);
 
-        if messages.is_empty() || !caller_is_authorized {
+        if !caller_is_authorized {
             return Err(StoreError::NotFound(format!("thread '{thread}' not found")));
-        }
-
-        let truncated = messages.len() > 200;
-        if truncated {
-            messages.truncate(200);
         }
 
         Ok(ThreadResponse {
@@ -2348,6 +2763,290 @@ mod schema_tests {
         assert!(matches!(
             store.send("workstation", changed),
             Err(StoreError::Conflict(message)) if message.contains("different request content")
+        ));
+    }
+
+    #[test]
+    fn recipient_index_backfills_legacy_rows_and_cascades_on_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let store = Store::open(&data_dir, StoreConfig::default()).unwrap();
+        let (sent, _) = store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:sender".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Announce,
+                    thread: None,
+                    reply_to: None,
+                    body: "Backfill target".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: Some(60),
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+        {
+            let db = store.conn.lock().unwrap();
+            db.execute("DELETE FROM message_recipients", []).unwrap();
+        }
+        drop(store);
+
+        let reopened = Store::open(&data_dir, StoreConfig::default()).unwrap();
+        let count: i64 = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM message_recipients WHERE seq=?1 AND selector='mac:codex:worker'",
+                [sent.seq],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let inbox = reopened
+            .inbox("mac", "codex:worker", Some(0), None, None, false)
+            .unwrap();
+        assert_eq!(inbox.messages.len(), 1);
+
+        reopened
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET expires_ms=?1 WHERE seq=?2",
+                params![now_ms() - 1, sent.seq],
+            )
+            .unwrap();
+        reopened.prune_expired().unwrap();
+        let remaining: i64 = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_recipients", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn sender_can_cancel_and_post_progress_without_stealing_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("data"), StoreConfig::default()).unwrap();
+        store
+            .register(
+                "mac",
+                RegisterRequest {
+                    agent: "codex:worker".into(),
+                    ..RegisterRequest::default()
+                },
+            )
+            .unwrap();
+
+        let (req, _) = store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Request,
+                    thread: None,
+                    reply_to: None,
+                    body: "Please run verification".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: Some(3600),
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .send(
+                "mac",
+                SendRequest {
+                    agent: "codex:worker".into(),
+                    to: vec!["workstation:agy:requester".into()],
+                    performative: Performative::Accept,
+                    thread: Some(req.thread.clone()),
+                    reply_to: Some(req.seq),
+                    body: "Accepted".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: Some(600),
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Progress,
+                    thread: Some(req.thread.clone()),
+                    reply_to: Some(req.seq),
+                    body: "Should fail with lease_secs".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: Some(300),
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            ),
+            Err(StoreError::BadRequest(_))
+        ));
+
+        store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Progress,
+                    thread: Some(req.thread.clone()),
+                    reply_to: Some(req.seq),
+                    body: "Clarification update from requester".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        let thread = store.thread("workstation", &req.thread).unwrap();
+        assert_eq!(thread.accepted_by.as_deref(), Some("mac:codex:worker"));
+        assert!(!thread.closed);
+
+        assert!(matches!(
+            store.send(
+                "mac",
+                SendRequest {
+                    agent: "codex:worker".into(),
+                    to: vec!["workstation:agy:requester".into()],
+                    performative: Performative::Cancel,
+                    thread: Some(req.thread.clone()),
+                    reply_to: Some(req.seq),
+                    body: "Unauthorized cancel".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+
+        store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Cancel,
+                    thread: Some(req.thread.clone()),
+                    reply_to: Some(req.seq),
+                    body: "No longer needed".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        let closed_thread = store.thread("workstation", &req.thread).unwrap();
+        assert!(closed_thread.closed);
+        assert!(store
+            .status("workstation")
+            .unwrap()
+            .open_requests
+            .is_empty());
+    }
+
+    #[test]
+    fn cancelled_query_rejects_subsequent_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("data"), StoreConfig::default()).unwrap();
+        let (query, _) = store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Query,
+                    thread: None,
+                    reply_to: None,
+                    body: "Still relevant?".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: Some(3600),
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .send(
+                "workstation",
+                SendRequest {
+                    agent: "agy:requester".into(),
+                    to: vec!["mac:codex:worker".into()],
+                    performative: Performative::Cancel,
+                    thread: Some(query.thread.clone()),
+                    reply_to: Some(query.seq),
+                    body: "Never mind".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.send(
+                "mac",
+                SendRequest {
+                    agent: "codex:worker".into(),
+                    to: vec!["workstation:agy:requester".into()],
+                    performative: Performative::Reply,
+                    thread: Some(query.thread),
+                    reply_to: Some(query.seq),
+                    body: "Late reply".into(),
+                    payload: None,
+                    idempotency_key: None,
+                    expires_in_secs: None,
+                    lease_secs: None,
+                    task_category: None,
+                    not_before_ms: None,
+                },
+            ),
+            Err(StoreError::Conflict(msg)) if msg.contains("already closed")
         ));
     }
 }

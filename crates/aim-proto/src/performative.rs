@@ -28,6 +28,8 @@ pub enum Performative {
     Progress,
     /// The final outcome of a request. Ends it; nobody replies to a result.
     Result,
+    /// Sender withdraws an open request or query.
+    Cancel,
     /// Something others should know about now (disk floor, runner offline).
     Alert,
     /// Work is stuck and needs someone.
@@ -39,7 +41,7 @@ pub enum Performative {
 use Performative::*;
 
 impl Performative {
-    pub const ALL: [Performative; 12] = [
+    pub const ALL: [Performative; 13] = [
         Announce,
         Query,
         Reply,
@@ -49,6 +51,7 @@ impl Performative {
         Reject,
         Progress,
         Result,
+        Cancel,
         Alert,
         Blocker,
         Conflict,
@@ -65,6 +68,7 @@ impl Performative {
             Reject => "REJECT",
             Progress => "PROGRESS",
             Result => "RESULT",
+            Cancel => "CANCEL",
             Alert => "ALERT",
             Blocker => "BLOCKER",
             Conflict => "CONFLICT",
@@ -92,14 +96,14 @@ impl Performative {
     /// May `self` be sent as a reply to a message of type `parent`?
     pub fn may_reply_to(self, parent: Performative) -> bool {
         let allowed: &[Performative] = match parent {
-            Query => &[Reply, Reject],
-            Request | RequestVerify => &[Accept, Reject, Progress, Result, Query],
+            Query => &[Reply, Reject, Query, Cancel],
+            Request | RequestVerify => &[Accept, Reject, Progress, Result, Query, Cancel],
             Announce => &[Conflict, Blocker, Query],
             Reply => &[Query, Request, RequestVerify],
             Accept | Progress => &[Query, Blocker],
             Reject => &[Query, Request, RequestVerify],
-            // A result is terminal: only a new request may follow it.
-            Result => &[Request, RequestVerify],
+            // Results and cancellations are terminal: only a new request may follow.
+            Result | Cancel => &[Request, RequestVerify],
             Alert | Blocker => &[Reply, Progress, Result, Query],
             Conflict => &[Reply, Query],
         };
@@ -124,11 +128,21 @@ mod tests {
     }
 
     #[test]
-    fn results_are_terminal() {
+    fn results_and_cancellations_are_terminal() {
         for p in Performative::ALL {
-            let allowed = p.may_reply_to(Result);
-            assert_eq!(allowed, p.is_request(), "{p:?} after RESULT");
+            assert_eq!(p.may_reply_to(Result), p.is_request(), "{p:?} after RESULT");
+            assert_eq!(p.may_reply_to(Cancel), p.is_request(), "{p:?} after CANCEL");
         }
+    }
+
+    #[test]
+    fn queries_allow_follow_up_and_cancel() {
+        assert!(Query.may_reply_to(Query));
+        assert!(Cancel.may_reply_to(Query));
+        assert!(Cancel.may_reply_to(Request));
+        assert!(Cancel.may_reply_to(RequestVerify));
+        assert!(!Cancel.may_reply_to(Announce));
+        assert!(!Cancel.may_reply_to(Reply));
     }
 
     #[test]
@@ -137,13 +151,15 @@ mod tests {
         // cannot be answered with another REPLY.
         assert!(!Reply.may_reply_to(Announce));
         assert!(!Reply.may_reply_to(Reply));
+        assert!(!Reply.may_reply_to(Cancel));
         assert!(!Announce.may_reply_to(Announce));
         assert!(!Announce.may_reply_to(Result));
+        assert!(!Announce.may_reply_to(Cancel));
     }
 
     #[test]
     fn replies_cannot_start_threads() {
-        for p in [Reply, Accept, Reject, Progress, Result] {
+        for p in [Reply, Accept, Reject, Progress, Result, Cancel] {
             assert!(!p.may_start_thread(), "{p:?}");
         }
     }

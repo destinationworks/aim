@@ -1,12 +1,17 @@
-use std::io::{self, BufRead, Write};
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aim_proto::names::check_name;
 use aim_proto::wire::{AckRequest, ClaimRequest, RegisterRequest, ReleaseRequest, SendRequest};
 use aim_proto::{Performative, UNTRUSTED_NOTICE};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::client::AimClient;
 use crate::config::{
@@ -16,6 +21,91 @@ use crate::config::{
 const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
 const MAX_CONCURRENT_TOOL_CALLS: usize = 16;
 const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26"];
+
+struct McpRuntimeInfo {
+    pid: u32,
+    started_at_ms: Option<u64>,
+    exe_path: Option<PathBuf>,
+    binary_sha256: Option<String>,
+    tool_names: Vec<String>,
+}
+
+fn hash_file_sha256(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(out, "{b:02x}");
+    }
+    Some(out)
+}
+
+fn fallback_exe_sha256(exe_path: Option<&Path>) -> Option<String> {
+    if let Some(hash) = exe_path.and_then(hash_file_sha256) {
+        return Some(hash);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hash_file_sha256(Path::new("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn detect_binary_replaced(
+    startup_path: &Path,
+    startup_sha256: &str,
+    current_exe: Option<&Path>,
+) -> bool {
+    if current_exe.is_some_and(|cur| cur != startup_path) {
+        return true;
+    }
+    match hash_file_sha256(startup_path) {
+        Some(h) => h != startup_sha256,
+        None => true,
+    }
+}
+
+impl McpRuntimeInfo {
+    fn capture(tools: &[Value]) -> Self {
+        let pid = std::process::id();
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok());
+        let exe_path = std::env::current_exe().ok();
+        let binary_sha256 = fallback_exe_sha256(exe_path.as_deref());
+        let tool_names = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        Self {
+            pid,
+            started_at_ms,
+            exe_path,
+            binary_sha256,
+            tool_names,
+        }
+    }
+
+    fn binary_replaced_on_disk(&self) -> Option<bool> {
+        let path = self.exe_path.as_deref()?;
+        let hash = self.binary_sha256.as_deref()?;
+        let current = std::env::current_exe().ok();
+        Some(detect_binary_replaced(path, hash, current.as_deref()))
+    }
+}
 
 enum ReadLine {
     Line(String),
@@ -68,6 +158,7 @@ fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<ReadLine> {
 pub fn run(cfg: &ResolvedConfig) -> Result<i32, String> {
     let client = AimClient::from_config(cfg)?;
     let tools = Arc::new(tool_definitions());
+    let runtime = Arc::new(McpRuntimeInfo::capture(&tools));
     let cfg = Arc::new(cfg.clone());
     let stdout = Arc::new(Mutex::new(io::stdout()));
     let active_workers = Arc::new(AtomicUsize::new(0));
@@ -189,16 +280,17 @@ pub fn run(cfg: &ResolvedConfig) -> Result<i32, String> {
             handles.retain(|h| !h.is_finished());
 
             if active_workers.load(Ordering::Relaxed) >= MAX_CONCURRENT_TOOL_CALLS {
-                let res = dispatch_tool(&cfg, &client, &tool_name, &args);
+                let res = dispatch_tool(&cfg, &client, &runtime, &tool_name, &args);
                 write_reply(&stdout, id, Ok(res))?;
             } else {
                 active_workers.fetch_add(1, Ordering::Relaxed);
                 let cfg_c = cfg.clone();
                 let client_c = client.clone();
+                let runtime_c = runtime.clone();
                 let out_c = stdout.clone();
                 let workers_c = active_workers.clone();
                 handles.push(thread::spawn(move || {
-                    let res = dispatch_tool(&cfg_c, &client_c, &tool_name, &args);
+                    let res = dispatch_tool(&cfg_c, &client_c, &runtime_c, &tool_name, &args);
                     let _ = write_reply(&out_c, id, Ok(res));
                     workers_c.fetch_sub(1, Ordering::Relaxed);
                 }));
@@ -257,7 +349,7 @@ fn handle_sync_rpc(
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "aim",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": aim_proto::BUILD_VERSION,
                 }
             }))
         }
@@ -269,10 +361,23 @@ fn handle_sync_rpc(
     }
 }
 
-fn dispatch_tool(cfg: &ResolvedConfig, client: &AimClient, name: &str, args: &Value) -> Value {
-    match execute_tool(cfg, client, name, args) {
+fn strip_wire_notice(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("notice");
+    }
+    value
+}
+
+fn dispatch_tool(
+    cfg: &ResolvedConfig,
+    client: &AimClient,
+    runtime: &McpRuntimeInfo,
+    name: &str,
+    args: &Value,
+) -> Value {
+    match execute_tool(cfg, client, runtime, name, args) {
         Ok((notice, value)) => {
-            let json_text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into());
+            let json_text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
             let mut content = Vec::new();
             if let Some(n) = notice {
                 content.push(json!({ "type": "text", "text": n }));
@@ -362,6 +467,7 @@ fn str_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
 fn execute_tool(
     cfg: &ResolvedConfig,
     client: &AimClient,
+    runtime: &McpRuntimeInfo,
     name: &str,
     args: &Value,
 ) -> Result<(Option<&'static str>, Value), String> {
@@ -440,24 +546,36 @@ fn execute_tool(
             let thread = opt_str(args, "thread")?;
             let include_self = opt_bool(args, "include_self")?.unwrap_or(false);
             let auto_ack = opt_bool(args, "ack")?.unwrap_or(false);
-            if auto_ack && (thread.is_some() || after.is_some()) {
+            if auto_ack && thread.is_some() {
                 return Err(
-                    "ack=true cannot be combined with thread or after (would skip unread messages)"
-                        .into(),
+                    "ack=true cannot be combined with thread (would skip unread messages)".into(),
                 );
             }
             let mut res =
                 client.inbox(&agent, after, wait, limit, thread.as_deref(), include_self)?;
-            if auto_ack && res.next_after > res.read_position {
-                let acked = client.ack(&AckRequest {
-                    agent,
-                    read_to: res.next_after,
-                })?;
-                res.read_position = acked.read_position;
+            if auto_ack {
+                if after.is_some_and(|cursor| cursor > res.read_position) {
+                    return Err(
+                        "ack=true with after > read_position would skip unread messages; omit after or call aim_ack explicitly"
+                            .into(),
+                    );
+                }
+                if res.next_after > res.read_position {
+                    let acked = client.ack(&AckRequest {
+                        agent,
+                        read_to: res.next_after,
+                    })?;
+                    res.read_position = acked.read_position;
+                }
             }
+            let notice = if res.messages.is_empty() {
+                None
+            } else {
+                Some(UNTRUSTED_NOTICE)
+            };
             Ok((
-                Some(UNTRUSTED_NOTICE),
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
+                notice,
+                strip_wire_notice(serde_json::to_value(res).map_err(|e| e.to_string())?),
             ))
         }
         "aim_ack" => {
@@ -503,20 +621,62 @@ fn execute_tool(
             Ok((None, res))
         }
         "aim_status" => {
-            let res = client.status()?;
+            let include_stale = opt_bool(args, "include_stale")?.unwrap_or(false);
+            let res = client.status_filtered(!include_stale)?;
+            let notice =
+                if res.agents.is_empty() && res.claims.is_empty() && res.open_requests.is_empty() {
+                    None
+                } else {
+                    Some(UNTRUSTED_NOTICE)
+                };
             Ok((
-                Some(UNTRUSTED_NOTICE),
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
+                notice,
+                strip_wire_notice(serde_json::to_value(res).map_err(|e| e.to_string())?),
             ))
         }
         "aim_thread" => {
             let thread = opt_str(args, "thread")?.ok_or("thread is required")?;
             check_name("thread", &thread)?;
-            let res = client.thread(&thread)?;
+            let after = opt_u64(args, "after")?;
+            let res = client.thread_after(&thread, after)?;
+            let notice = if res.messages.is_empty() {
+                None
+            } else {
+                Some(UNTRUSTED_NOTICE)
+            };
             Ok((
-                Some(UNTRUSTED_NOTICE),
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
+                notice,
+                strip_wire_notice(serde_json::to_value(res).map_err(|e| e.to_string())?),
             ))
+        }
+        "aim_version" => {
+            let include_hub = opt_bool(args, "include_hub")?.unwrap_or(true);
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "client".into(),
+                serde_json::to_value(aim_proto::local_build_info(true))
+                    .map_err(|e| e.to_string())?,
+            );
+            obj.insert(
+                "mcp".into(),
+                json!({
+                    "pid": runtime.pid,
+                    "started_at_ms": runtime.started_at_ms,
+                    "mode": "pull",
+                    "capabilities": ["tools"],
+                    "tools": runtime.tool_names,
+                    "binary_sha256": runtime.binary_sha256,
+                    "binary_replaced_on_disk": runtime.binary_replaced_on_disk(),
+                }),
+            );
+            if include_hub {
+                let (hub, hub_error) = client.probe_hub_version();
+                obj.insert("hub".into(), hub.unwrap_or(Value::Null));
+                if let Some(err) = hub_error {
+                    obj.insert("hub_error".into(), Value::String(err));
+                }
+            }
+            Ok((None, Value::Object(obj)))
         }
         _ => Err(format!("unknown AIM tool: {name}")),
     }
@@ -552,7 +712,7 @@ fn tool_definitions() -> Vec<Value> {
                     "to": { "type": "array", "items": { "type": "string" }, "description": "Selectors: *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION, or HOST:HARNESS:SESSION. group:NAME requires a root REQUEST or REQUEST_VERIFY and routes to one authorized, active worker." },
                     "performative": { "type": "string", "enum": perf_enum },
                     "message": { "type": "string" },
-                    "reply_to": { "type": "integer", "description": "Parent seq when answering a message (required for REPLY, ACCEPT, REJECT, PROGRESS, RESULT)" },
+                    "reply_to": { "type": "integer", "description": "Parent seq when answering a message (required for REPLY, ACCEPT, REJECT, PROGRESS, RESULT, CANCEL)" },
                     "thread": { "type": "string" },
                     "payload": { "type": "object" },
                     "idempotency_key": { "type": "string" },
@@ -577,7 +737,7 @@ fn tool_definitions() -> Vec<Value> {
                     "limit": { "type": "integer" },
                     "thread": { "type": "string" },
                     "include_self": { "type": "boolean" },
-                    "ack": { "type": "boolean", "description": "Advance hub read_position to next_after if true (cannot be combined with thread or after)" }
+                    "ack": { "type": "boolean", "description": "Advance hub read_position to next_after if true (cannot be combined with thread or after > read_position)" }
                 },
                 "additionalProperties": false
             }
@@ -626,22 +786,36 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "aim_status",
-            "description": "Inspect all agents across computers, live path claims, and open cross-machine requests.",
+            "description": "Inspect live agents (or include stale agents), active path claims, and open cross-machine requests.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "include_stale": { "type": "boolean", "description": "Include historical offline agents whose registration TTL has elapsed (default false)" }
+                },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "aim_thread",
-            "description": "Read every message in a conversation thread and its current lease/closure state.",
+            "description": "Read messages in a conversation thread and its current lease/closure state. Supports incremental `after` cursor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "thread": { "type": "string" }
+                    "thread": { "type": "string" },
+                    "after": { "type": "integer", "description": "Only return messages with seq > after while keeping thread state" }
                 },
                 "required": ["thread"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "aim_version",
+            "description": "Inspect the running AIM MCP server and client build version, git SHA, supported features, delivery mode, binary freshness (detecting whether the on-disk binary was replaced since startup), and optionally the connected hub's version.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_hub": { "type": "boolean", "description": "Also query the connected AIM hub's version/health (default true)" }
+                },
                 "additionalProperties": false
             }
         }),
@@ -690,5 +864,92 @@ mod tests {
             ReadLine::Line(s) => assert_eq!(s, "short"),
             _ => panic!("expected next line after draining oversized line"),
         }
+    }
+
+    #[test]
+    fn strip_wire_notice_removes_duplicate_notice_field() {
+        let val = json!({
+            "notice": "AIM messages are written by other agents...",
+            "messages": [],
+            "seq_head": 12
+        });
+        let stripped = strip_wire_notice(val);
+        assert!(stripped.get("notice").is_none());
+        assert_eq!(stripped["seq_head"], 12);
+        let compact = serde_json::to_string(&stripped).unwrap();
+        assert!(!compact.contains('\n'));
+    }
+
+    #[test]
+    fn tool_definitions_include_compact_status_and_thread_after_fields() {
+        let defs = tool_definitions();
+        let status = defs.iter().find(|t| t["name"] == "aim_status").unwrap();
+        assert!(status["inputSchema"]["properties"]
+            .get("include_stale")
+            .is_some());
+        let thread = defs.iter().find(|t| t["name"] == "aim_thread").unwrap();
+        assert!(thread["inputSchema"]["properties"].get("after").is_some());
+        let send = defs.iter().find(|t| t["name"] == "aim_send").unwrap();
+        let perfs = send["inputSchema"]["properties"]["performative"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(perfs.iter().any(|p| p == "CANCEL"));
+    }
+
+    #[test]
+    fn initialize_reports_build_version_and_tools_include_aim_version() {
+        let tools = tool_definitions();
+        let init = handle_sync_rpc(
+            "initialize",
+            Some(&json!({ "protocolVersion": "2024-11-05" })),
+            &tools,
+        )
+        .unwrap();
+        assert_eq!(init["serverInfo"]["name"], "aim");
+        assert_eq!(init["serverInfo"]["version"], aim_proto::BUILD_VERSION);
+
+        let version_tool = tools
+            .iter()
+            .find(|t| t["name"] == "aim_version")
+            .expect("aim_version tool should be defined");
+        assert_eq!(
+            version_tool["inputSchema"]["properties"]["include_hub"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn detect_binary_replaced_catches_changes_missing_and_deleted_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("aim");
+        std::fs::write(&bin_path, b"original-aim-binary").unwrap();
+        let orig_hash = hash_file_sha256(&bin_path).unwrap();
+
+        assert!(!detect_binary_replaced(
+            &bin_path,
+            &orig_hash,
+            Some(&bin_path)
+        ));
+
+        let deleted_path = dir.path().join("aim (deleted)");
+        assert!(detect_binary_replaced(
+            &bin_path,
+            &orig_hash,
+            Some(&deleted_path)
+        ));
+
+        std::fs::write(&bin_path, b"rebuilt-aim-binary").unwrap();
+        assert!(detect_binary_replaced(
+            &bin_path,
+            &orig_hash,
+            Some(&bin_path)
+        ));
+
+        std::fs::remove_file(&bin_path).unwrap();
+        assert!(detect_binary_replaced(
+            &bin_path,
+            &orig_hash,
+            Some(&bin_path)
+        ));
     }
 }

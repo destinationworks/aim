@@ -9,7 +9,11 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "aim-server", about = "AIM (AI Messages) HTTPS hub server")]
+#[command(
+    name = "aim-server",
+    version = aim_proto::BUILD_VERSION,
+    about = "AIM (AI Messages) HTTPS hub server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -17,6 +21,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print build version and feature metadata as JSON
+    Version,
     /// Run the AIM HTTPS hub server
     Serve {
         #[arg(long, default_value = "/etc/aim/server.toml")]
@@ -111,6 +117,10 @@ struct KeygenArgs {
 fn main() {
     let cli = Cli::parse();
     let res = match cli.command {
+        Command::Version => {
+            println!("{}", json!(aim_proto::local_build_info(true)));
+            Ok(())
+        }
         Command::Serve { config } => run_serve(&config),
         Command::InitCa(args) => {
             init_ca(&args.ca_cert, &args.ca_key, &args.cn, args.days, args.force).map(|()| {
