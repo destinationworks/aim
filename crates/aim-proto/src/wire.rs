@@ -163,6 +163,16 @@ impl SendRequest {
             .iter()
             .map(|t| Selector::parse(t))
             .collect::<Result<Vec<_>, _>>()?;
+        if selectors
+            .iter()
+            .any(|selector| matches!(selector, Selector::Group(_)))
+            && (selectors.len() != 1 || !self.performative.is_request() || self.reply_to.is_some())
+        {
+            return Err(
+                "group recipient must be the sole recipient of a root REQUEST or REQUEST_VERIFY"
+                    .into(),
+            );
+        }
         if let Some(thread) = &self.thread {
             check_name("thread", thread)?;
         }
@@ -229,6 +239,9 @@ pub struct SendResponse {
     pub thread: String,
     /// The idempotency key was seen before; nothing new was stored.
     pub duplicate: bool,
+    /// Worker selected for a server-configured group request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

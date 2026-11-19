@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aim_proto::names::{check_name, valid_name};
 use aim_proto::wire::{check_sha256, MAX_CLAIM_TTL_SECS, MAX_EXPIRY_SECS, MAX_LEASE_SECS};
+use aim_proto::AgentId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -13,6 +14,14 @@ pub struct KeyEntry {
     pub sha256: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupConfig {
+    pub name: String,
+    pub members: Vec<String>,
+    pub posting_hosts: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -55,6 +64,8 @@ pub struct ServerConfig {
     pub agent_retention_secs: u64,
     #[serde(default)]
     pub keys: Vec<KeyEntry>,
+    #[serde(default)]
+    pub groups: Vec<GroupConfig>,
 }
 
 fn default_listen() -> String {
@@ -141,6 +152,7 @@ impl ServerConfig {
             auth_failures_per_minute: default_auth_failures_per_minute(),
             agent_retention_secs: default_agent_retention(),
             keys: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -212,6 +224,7 @@ impl ServerConfig {
             }
         }
         let mut seen = HashSet::new();
+        let known_hosts: HashSet<&str> = self.keys.iter().map(|key| key.host.as_str()).collect();
         for key in &self.keys {
             check_name("key host", &key.host)?;
             check_sha256(&key.sha256)?;
@@ -220,6 +233,63 @@ impl ServerConfig {
                     "duplicate key sha256 in keys (host '{}'); every key must be unique",
                     key.host
                 ));
+            }
+        }
+        if self.groups.len() > 256 {
+            return Err("at most 256 groups may be configured".into());
+        }
+        let mut group_names = HashSet::new();
+        for group in &self.groups {
+            check_name("group", &group.name)?;
+            if !group_names.insert(&group.name) {
+                return Err(format!("duplicate group name '{}'", group.name));
+            }
+            if group.members.is_empty() || group.members.len() > 128 {
+                return Err(format!("group '{}' must have 1-128 members", group.name));
+            }
+            if group.posting_hosts.is_empty() || group.posting_hosts.len() > 128 {
+                return Err(format!(
+                    "group '{}' must have 1-128 posting_hosts",
+                    group.name
+                ));
+            }
+            let mut members = HashSet::new();
+            for member in &group.members {
+                let parsed = AgentId::parse_full(member)?;
+                if parsed.to_string() != *member {
+                    return Err(format!(
+                        "group '{}' member '{member}' is not a canonical agent ID",
+                        group.name
+                    ));
+                }
+                if !members.insert(member) {
+                    return Err(format!(
+                        "group '{}' contains duplicate member '{member}'",
+                        group.name
+                    ));
+                }
+                if !known_hosts.contains(parsed.host.as_str()) {
+                    return Err(format!(
+                        "group '{}' member '{member}' uses unconfigured host '{}'",
+                        group.name, parsed.host
+                    ));
+                }
+            }
+            let mut posting_hosts = HashSet::new();
+            for host in &group.posting_hosts {
+                check_name("group posting host", host)?;
+                if !posting_hosts.insert(host) {
+                    return Err(format!(
+                        "group '{}' contains duplicate posting host '{host}'",
+                        group.name
+                    ));
+                }
+                if !known_hosts.contains(host.as_str()) {
+                    return Err(format!(
+                        "group '{}' posting host '{host}' has no configured key",
+                        group.name
+                    ));
+                }
             }
         }
         Ok(())
@@ -284,6 +354,44 @@ mod tests {
             },
         ];
         assert!(cfg.validate().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn validates_group_names_members_and_posting_hosts() {
+        let mut cfg = ServerConfig::defaults_for("d".into(), "c".into(), "k".into());
+        cfg.groups = vec![GroupConfig {
+            name: "reviewers".into(),
+            members: vec!["macbook:codex:reviewer".into()],
+            posting_hosts: vec!["workstation".into()],
+        }];
+        cfg.keys = vec![
+            KeyEntry {
+                host: "macbook".into(),
+                sha256: "ab".repeat(32),
+                enabled: true,
+            },
+            KeyEntry {
+                host: "workstation".into(),
+                sha256: "cd".repeat(32),
+                enabled: true,
+            },
+            KeyEntry {
+                host: "win-dev".into(),
+                sha256: "ef".repeat(32),
+                enabled: true,
+            },
+        ];
+        cfg.validate().unwrap();
+
+        cfg.groups[0].members.push("macbook:codex:reviewer".into());
+        assert!(cfg.validate().unwrap_err().contains("duplicate member"));
+
+        cfg.groups[0].members = vec!["not-a-full-agent-id".into()];
+        assert!(cfg.validate().unwrap_err().contains("HOST:HARNESS:SESSION"));
+
+        cfg.groups[0].members = vec!["macbook:codex:reviewer".into()];
+        cfg.groups[0].posting_hosts.clear();
+        assert!(cfg.validate().unwrap_err().contains("posting_hosts"));
     }
 
     #[test]

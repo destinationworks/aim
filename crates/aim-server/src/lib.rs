@@ -29,6 +29,7 @@ pub fn build_hub_state(cfg: &ServerConfig) -> Result<HubState, String> {
         max_claims_per_host: cfg.max_claims_per_host,
         max_artifacts_total_bytes: cfg.max_artifacts_total_bytes,
         agent_retention_ms: (cfg.agent_retention_secs as i64) * 1000,
+        groups: cfg.groups.clone(),
     };
     let store = Store::open(&cfg.data_dir, store_cfg)?;
     let keyring = KeyRing::from_entries(&cfg.keys)?;

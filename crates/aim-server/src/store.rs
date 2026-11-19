@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::config::GroupConfig;
 use aim_proto::address::{deliverable, AgentId, Recipient, Selector};
 use aim_proto::artifact::decompress_verified;
 use aim_proto::guard::find_secret_bytes;
@@ -50,6 +51,7 @@ pub struct StoreConfig {
     pub max_claims_per_host: usize,
     pub max_artifacts_total_bytes: u64,
     pub agent_retention_ms: i64,
+    pub groups: Vec<GroupConfig>,
 }
 
 impl Default for StoreConfig {
@@ -64,6 +66,7 @@ impl Default for StoreConfig {
             max_claims_per_host: 256,
             max_artifacts_total_bytes: 512 * 1024 * 1024,
             agent_retention_ms: 30 * 24 * 3600 * 1000,
+            groups: Vec::new(),
         }
     }
 }
@@ -416,12 +419,34 @@ impl Store {
     pub fn send(
         &self,
         host: &str,
-        req: SendRequest,
+        mut req: SendRequest,
     ) -> Result<(SendResponse, Option<u64>), StoreError> {
-        req.validate().map_err(StoreError::BadRequest)?;
+        let selectors = req.validate().map_err(StoreError::BadRequest)?;
         let sender_id = AgentId::from_local(host, &req.agent).map_err(StoreError::BadRequest)?;
         let sender_str = sender_id.to_string();
         let now = now_ms();
+        let requested_group = selectors.iter().find_map(|selector| match selector {
+            Selector::Group(name) => Some(name.as_str()),
+            _ => None,
+        });
+        let group_config = requested_group
+            .map(|group_name| {
+                let group = self
+                    .cfg
+                    .groups
+                    .iter()
+                    .find(|group| group.name == group_name)
+                    .ok_or_else(|| {
+                        StoreError::BadRequest(format!("unknown group '{group_name}'"))
+                    })?;
+                if !group.posting_hosts.iter().any(|allowed| allowed == host) {
+                    return Err(StoreError::NotFound(format!(
+                        "group '{group_name}' not found"
+                    )));
+                }
+                Ok(group)
+            })
+            .transpose()?;
 
         let mut db = self
             .conn
@@ -453,15 +478,22 @@ impl Store {
         )?;
 
         if let Some(ref idem) = req.idempotency_key {
-            let existing: Option<(i64, String, String, i64)> = tx
+            let existing: Option<(i64, String, String, i64, String)> = tx
                 .query_row(
-                    "SELECT seq, msg_id, thread, expires_ms FROM messages WHERE sender=?1 AND idempotency_key=?2",
+                    "SELECT seq, msg_id, thread, expires_ms, to_json FROM messages WHERE sender=?1 AND idempotency_key=?2",
                     params![&sender_str, idem],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            if let Some((seq, msg_id, thread, expires_ms)) = existing {
+            if let Some((seq, msg_id, thread, expires_ms, to_json)) = existing {
                 if expires_ms > now {
+                    let assigned_to = if requested_group.is_some() {
+                        serde_json::from_str::<Vec<String>>(&to_json)
+                            .ok()
+                            .and_then(|recipients| recipients.into_iter().next())
+                    } else {
+                        None
+                    };
                     tx.commit()?;
                     return Ok((
                         SendResponse {
@@ -469,12 +501,22 @@ impl Store {
                             msg_id,
                             thread,
                             duplicate: true,
+                            assigned_to,
                         },
                         None,
                     ));
                 }
             }
         }
+
+        let assigned_to = if let Some(group) = group_config {
+            let cutoff_ms = now.saturating_sub(self.cfg.agent_ttl_ms);
+            let assignee = crate::assignment::choose(&tx, &group.members, cutoff_ms)?;
+            req.to = vec![assignee.clone()];
+            Some(assignee)
+        } else {
+            None
+        };
 
         let msg_id = new_msg_id(now);
         let thread = if let Some(parent_seq_u64) = req.reply_to {
@@ -690,6 +732,7 @@ impl Store {
                 msg_id,
                 thread,
                 duplicate: false,
+                assigned_to,
             },
             Some(seq),
         ))
@@ -1504,6 +1547,7 @@ pub fn host_can_view_message(
                     }
                 }
             }
+            Selector::Group(_) => {}
             Selector::Harness(ref h) => {
                 let found: bool = conn
                     .query_row(

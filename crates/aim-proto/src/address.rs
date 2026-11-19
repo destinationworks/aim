@@ -75,6 +75,8 @@ pub enum Selector {
     Repo(String),
     /// `cap:NAME`: every agent advertising that capability.
     Cap(String),
+    /// `group:NAME`: server-configured group, resolved to one member for a request.
+    Group(String),
     /// `HOST:HARNESS:SESSION`: exactly one agent.
     Agent(AgentId),
     /// `SESSION`: the agent with this session id, on any computer.
@@ -100,8 +102,9 @@ impl Selector {
                     "harness" => Ok(Self::Harness(name)),
                     "repo" => Ok(Self::Repo(name)),
                     "cap" => Ok(Self::Cap(name)),
+                    "group" => Ok(Self::Group(name)),
                     _ => Err(format!(
-                        "unknown recipient kind '{kind}': use *, host:NAME, harness:NAME, repo:NAME, cap:NAME, SESSION or HOST:HARNESS:SESSION"
+                        "unknown recipient kind '{kind}': use *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION or HOST:HARNESS:SESSION"
                     )),
                 }
             }
@@ -125,6 +128,8 @@ impl Selector {
             Self::Harness(harness) => *harness == recipient.id.harness,
             Self::Repo(repo) => recipient.repo == Some(repo.as_str()),
             Self::Cap(cap) => recipient.caps.iter().any(|c| c == cap),
+            // The hub resolves groups before storing messages.
+            Self::Group(_) => false,
             Self::Agent(id) => id == recipient.id,
             Self::Session(session) => *session == recipient.id.session,
         }
@@ -139,6 +144,7 @@ impl fmt::Display for Selector {
             Self::Harness(n) => write!(f, "harness:{n}"),
             Self::Repo(n) => write!(f, "repo:{n}"),
             Self::Cap(n) => write!(f, "cap:{n}"),
+            Self::Group(n) => write!(f, "group:{n}"),
             Self::Agent(id) => write!(f, "{id}"),
             Self::Session(s) => f.write_str(s),
         }
@@ -195,6 +201,7 @@ mod tests {
             "harness:agy",
             "repo:example-repo",
             "cap:macos-gui",
+            "group:reviewers",
             "host-b:agy:s1",
             "s1",
         ] {

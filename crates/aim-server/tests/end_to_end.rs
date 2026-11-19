@@ -10,7 +10,7 @@ use aim_proto::wire::{AckRequest, ClaimRequest, RegisterRequest, ReleaseRequest,
 use aim_proto::{Performative, PROTOCOL};
 use aim_server::auth::{generate_token, hash_token_hex};
 use aim_server::certs::{init_ca, init_server_cert};
-use aim_server::config::{KeyEntry, ServerConfig};
+use aim_server::config::{GroupConfig, KeyEntry, ServerConfig};
 use aim_server::serve_with_handle;
 use axum_server::Handle;
 use tempfile::TempDir;
@@ -111,6 +111,14 @@ async fn start_harness() -> Harness {
             enabled: false,
         },
     ];
+    cfg.groups = vec![GroupConfig {
+        name: "reviewers".into(),
+        members: vec![
+            "macbook:codex:reviewer".into(),
+            "win-dev:claude:reviewer".into(),
+        ],
+        posting_hosts: vec!["workstation".into()],
+    }];
 
     let handle = Handle::new();
     let srv_handle = handle.clone();
@@ -133,6 +141,118 @@ async fn start_harness() -> Harness {
         disabled_key,
         handle,
     }
+}
+
+#[tokio::test]
+async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignment() {
+    let h = start_harness().await;
+    let mac = h.client_for(&h.mac_key);
+    let wks = h.client_for(&h.wks_key);
+    let win = h.client_for(&h.win_key);
+
+    for (client, agent) in [
+        (mac.clone(), "codex:reviewer"),
+        (win.clone(), "claude:reviewer"),
+    ] {
+        tokio::task::spawn_blocking(move || {
+            client.register(&RegisterRequest {
+                agent: agent.into(),
+                ..RegisterRequest::default()
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    let req = SendRequest {
+        agent: "agy:sender".into(),
+        to: vec!["group:reviewers".into()],
+        performative: Performative::RequestVerify,
+        thread: None,
+        reply_to: None,
+        body: "Verify the cross-platform build".into(),
+        payload: None,
+        idempotency_key: Some("group-request-1".into()),
+        expires_in_secs: None,
+        lease_secs: None,
+    };
+    let sent = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        let req = req.clone();
+        move || client.send(&req)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(sent.assigned_to.as_deref(), Some("macbook:codex:reviewer"));
+
+    let retry = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || client.send(&req)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(retry.seq, sent.seq);
+    assert_eq!(retry.assigned_to, sent.assigned_to);
+
+    let mac_inbox = tokio::task::spawn_blocking({
+        let client = mac.clone();
+        move || client.inbox("codex:reviewer", Some(0), Some(0), None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let win_inbox = tokio::task::spawn_blocking({
+        let client = win.clone();
+        move || client.inbox("claude:reviewer", Some(0), Some(0), None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(mac_inbox.messages.len(), 1);
+    assert_eq!(mac_inbox.messages[0].seq, sent.seq);
+    assert!(win_inbox.messages.is_empty());
+
+    let forbidden = SendRequest {
+        agent: "agy:sender".into(),
+        to: vec!["group:reviewers".into()],
+        performative: Performative::Alert,
+        thread: None,
+        reply_to: None,
+        body: "An alert to a group".into(),
+        payload: None,
+        idempotency_key: None,
+        expires_in_secs: None,
+        lease_secs: None,
+    };
+    assert!(forbidden
+        .validate()
+        .unwrap_err()
+        .contains("group recipient"));
+
+    let unauthorized = tokio::task::spawn_blocking({
+        let client = mac.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "codex:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::Request,
+                thread: None,
+                reply_to: None,
+                body: "Unauthorized group post".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: None,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(unauthorized.unwrap_err().contains("404"));
 }
 
 #[tokio::test]
