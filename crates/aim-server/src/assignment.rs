@@ -5,12 +5,15 @@ use rusqlite::{params, Transaction};
 use crate::store::StoreError;
 
 /// Choose one currently registered group member, preferring the member with
-/// the oldest prior direct request assignment. The exact recipient is stored
-/// on the message so later retries and replies keep the same assignment.
+/// the oldest prior assignment for this group and task category. The exact
+/// recipient is stored on the message so later retries keep the assignment.
 pub(crate) fn choose(
     tx: &Transaction<'_>,
+    group: &str,
+    task_category: &str,
     candidates: &[String],
     cutoff_ms: i64,
+    sender: &str,
 ) -> Result<String, StoreError> {
     let mut eligible = BTreeMap::<Option<i64>, String>::new();
 
@@ -21,18 +24,19 @@ pub(crate) fn choose(
                 "group member '{candidate}' is not a canonical agent ID"
             )));
         }
+        if candidate == sender {
+            continue;
+        }
         let active: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1 AND seen_ms>=?2)",
             params![candidate, cutoff_ms],
             |row| row.get(0),
         )?;
         if active {
-            let exact_recipient = serde_json::to_string(&[candidate])
-                .map_err(|error| StoreError::Internal(error.to_string()))?;
             let assigned_at: Option<i64> = tx.query_row(
-                "SELECT MAX(created_ms) FROM messages
-                 WHERE to_json=?1 AND performative IN ('REQUEST', 'REQUEST_VERIFY')",
-                [&exact_recipient],
+                "SELECT MAX(seq) FROM messages
+                 WHERE assigned_group=?1 AND task_category=?2 AND assigned_to=?3",
+                params![group, task_category, candidate],
                 |row| row.get(0),
             )?;
             eligible
@@ -57,9 +61,10 @@ mod tests {
         db.execute_batch(
             "CREATE TABLE agents (id TEXT PRIMARY KEY, seen_ms INTEGER NOT NULL);
              CREATE TABLE messages (
-                 to_json TEXT NOT NULL,
-                 performative TEXT NOT NULL,
-                 created_ms INTEGER NOT NULL
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 assigned_group TEXT,
+                 task_category TEXT,
+                 assigned_to TEXT
              );",
         )
         .unwrap();
@@ -79,17 +84,27 @@ mod tests {
             params![candidates[0], candidates[1], candidates[2]],
         )
         .unwrap();
-        let first_recipient = serde_json::to_string(&[&candidates[0]]).unwrap();
-        let second_recipient = serde_json::to_string(&[&candidates[1]]).unwrap();
         db.execute(
-            "INSERT INTO messages (to_json, performative, created_ms)
-             VALUES (?1, 'REQUEST', 20), (?2, 'REQUEST_VERIFY', 20)",
-            params![first_recipient, second_recipient],
+            "INSERT INTO messages (assigned_group, task_category, assigned_to)
+             VALUES ('reviewers', 'platform-verification', ?1),
+                    ('reviewers', 'platform-verification', ?2)",
+            params![candidates[0], candidates[1]],
         )
         .unwrap();
 
         let tx = db.transaction().unwrap();
-        assert_eq!(choose(&tx, &candidates, 50).unwrap(), candidates[2]);
+        assert_eq!(
+            choose(
+                &tx,
+                "reviewers",
+                "platform-verification",
+                &candidates,
+                50,
+                "mac:agy:sender"
+            )
+            .unwrap(),
+            candidates[2]
+        );
         tx.rollback().unwrap();
     }
 
@@ -104,7 +119,62 @@ mod tests {
         .unwrap();
 
         let tx = db.transaction().unwrap();
-        assert_eq!(choose(&tx, &candidates, 50).unwrap(), "mac:codex:one");
+        assert_eq!(
+            choose(
+                &tx,
+                "reviewers",
+                "platform-verification",
+                &candidates,
+                50,
+                "mac:agy:sender"
+            )
+            .unwrap(),
+            "mac:codex:one"
+        );
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn assignment_history_is_scoped_to_the_task_category() {
+        let (mut db, candidates) = setup();
+        db.execute(
+            "INSERT INTO agents (id, seen_ms) VALUES (?1, 100), (?2, 100), (?3, 100)",
+            params![candidates[0], candidates[1], candidates[2]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO messages (assigned_group, task_category, assigned_to)
+             VALUES ('reviewers', 'security-review', ?1),
+                    ('reviewers', 'build-verification', ?2)",
+            params![candidates[0], candidates[1]],
+        )
+        .unwrap();
+
+        let tx = db.transaction().unwrap();
+        assert_eq!(
+            choose(
+                &tx,
+                "reviewers",
+                "security-review",
+                &candidates,
+                50,
+                "mac:agy:sender"
+            )
+            .unwrap(),
+            candidates[1]
+        );
+        assert_eq!(
+            choose(
+                &tx,
+                "reviewers",
+                "build-verification",
+                &candidates,
+                50,
+                "mac:agy:sender"
+            )
+            .unwrap(),
+            candidates[0]
+        );
         tx.rollback().unwrap();
     }
 
@@ -118,7 +188,18 @@ mod tests {
         .unwrap();
 
         let tx = db.transaction().unwrap();
-        assert_eq!(choose(&tx, &candidates, 50).unwrap(), candidates[1]);
+        assert_eq!(
+            choose(
+                &tx,
+                "reviewers",
+                "platform-verification",
+                &candidates,
+                50,
+                "mac:agy:sender"
+            )
+            .unwrap(),
+            candidates[1]
+        );
         tx.rollback().unwrap();
     }
 
@@ -127,7 +208,38 @@ mod tests {
         let (mut db, candidates) = setup();
         let tx = db.transaction().unwrap();
         assert!(matches!(
-            choose(&tx, &candidates, 50),
+            choose(
+                &tx,
+                "reviewers",
+                "platform-verification",
+                &candidates,
+                50,
+                "mac:agy:sender"
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("no active")
+        ));
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn never_assigns_a_request_back_to_its_sender() {
+        let (mut db, candidates) = setup();
+        db.execute(
+            "INSERT INTO agents (id, seen_ms) VALUES (?1, 100)",
+            [&candidates[0]],
+        )
+        .unwrap();
+
+        let tx = db.transaction().unwrap();
+        assert!(matches!(
+            choose(
+                &tx,
+                "reviewers",
+                "platform-verification",
+                &[candidates[0].clone()],
+                50,
+                &candidates[0]
+            ),
             Err(StoreError::Conflict(message)) if message.contains("no active")
         ));
         tx.rollback().unwrap();

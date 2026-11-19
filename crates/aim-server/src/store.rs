@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::GroupConfig;
+use crate::config::{GroupConfig, GroupRole};
 use aim_proto::address::{deliverable, AgentId, Recipient, Selector};
 use aim_proto::artifact::decompress_verified;
 use aim_proto::guard::find_secret_bytes;
@@ -11,12 +11,13 @@ use aim_proto::wire::{
     check_artifact_name, check_sha256, paths_overlap, AckRequest, AckResponse, AgentInfo,
     ArtifactInfo, ClaimInfo, ClaimRequest, ClaimResponse, InboxResponse, Message, OpenRequest,
     RegisterRequest, RegisterResponse, ReleaseRequest, SendRequest, SendResponse, StatusResponse,
-    ThreadResponse,
+    ThreadResponse, MAX_EXPIRY_SECS,
 };
 use aim_proto::{Performative, MAX_ARTIFACT_BR_BYTES, MAX_INBOX_LIMIT, UNTRUSTED_NOTICE};
 use rand::RngCore;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
 pub enum StoreError {
@@ -144,6 +145,7 @@ pub struct Store {
     artifacts_dir: PathBuf,
     artifact_io_lock: Arc<Mutex<()>>,
     cfg: StoreConfig,
+    keyring: Option<crate::auth::KeyRing>,
 }
 
 pub fn now_ms() -> i64 {
@@ -170,8 +172,106 @@ fn normalize_path(path: &str) -> String {
     aim_proto::wire::normalize_claim_path(path)
 }
 
+fn ensure_assignment_columns(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(messages)")
+        .map_err(|e| format!("cannot inspect message schema: {e}"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("cannot inspect message schema: {e}"))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()
+        .map_err(|e| format!("cannot read message schema: {e}"))?;
+    drop(stmt);
+
+    if !columns.contains("assigned_group") {
+        conn.execute("ALTER TABLE messages ADD COLUMN assigned_group TEXT", [])
+            .map_err(|e| format!("cannot add group assignment provenance: {e}"))?;
+    }
+    if !columns.contains("assigned_to") {
+        conn.execute("ALTER TABLE messages ADD COLUMN assigned_to TEXT", [])
+            .map_err(|e| format!("cannot add group assignment target: {e}"))?;
+    }
+    if !columns.contains("task_category") {
+        conn.execute("ALTER TABLE messages ADD COLUMN task_category TEXT", [])
+            .map_err(|e| format!("cannot add task category: {e}"))?;
+    }
+    if !columns.contains("assigned_role") {
+        conn.execute("ALTER TABLE messages ADD COLUMN assigned_role TEXT", [])
+            .map_err(|e| format!("cannot add assignment role: {e}"))?;
+    }
+    if !columns.contains("not_before_ms") {
+        conn.execute("ALTER TABLE messages ADD COLUMN not_before_ms INTEGER", [])
+            .map_err(|e| format!("cannot add scheduled delivery time: {e}"))?;
+    }
+    if !columns.contains("idempotency_fingerprint") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN idempotency_fingerprint TEXT",
+            [],
+        )
+        .map_err(|e| format!("cannot add idempotency request fingerprint: {e}"))?;
+    }
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_messages_assignment;
+         CREATE INDEX IF NOT EXISTS idx_messages_assignment_category
+         ON messages(assigned_group, task_category, assigned_to, seq);",
+    )
+    .map_err(|e| format!("cannot index group assignments: {e}"))?;
+    Ok(())
+}
+
+fn send_request_fingerprint(request: &SendRequest) -> Result<String, StoreError> {
+    let encoded = serde_json::to_vec(request).map_err(|error| {
+        StoreError::Internal(format!("cannot encode request fingerprint: {error}"))
+    })?;
+    let digest = Sha256::digest(encoded);
+    let hex = b"0123456789abcdef";
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        fingerprint.push(hex[(byte >> 4) as usize] as char);
+        fingerprint.push(hex[(byte & 0x0f) as usize] as char);
+    }
+    Ok(fingerprint)
+}
+
+fn touch_sender(
+    tx: &rusqlite::Transaction<'_>,
+    sender_id: &AgentId,
+    sender: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO agents(id, host, harness, session, caps_json, seen_ms, read_position)
+         VALUES(?1, ?2, ?3, ?4, '[]', ?5, 0)
+         ON CONFLICT(id) DO UPDATE SET seen_ms=excluded.seen_ms",
+        params![
+            sender,
+            sender_id.host,
+            sender_id.harness,
+            sender_id.session,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(data_dir: &Path, cfg: StoreConfig) -> Result<Self, String> {
+        Self::open_inner(data_dir, cfg, None)
+    }
+
+    pub fn open_with_keyring(
+        data_dir: &Path,
+        cfg: StoreConfig,
+        keyring: crate::auth::KeyRing,
+    ) -> Result<Self, String> {
+        Self::open_inner(data_dir, cfg, Some(keyring))
+    }
+
+    fn open_inner(
+        data_dir: &Path,
+        cfg: StoreConfig,
+        keyring: Option<crate::auth::KeyRing>,
+    ) -> Result<Self, String> {
         aim_fs::ensure_private_dir(data_dir)
             .map_err(|e| format!("cannot prepare data_dir {}: {e}", data_dir.display()))?;
         let artifacts_dir = data_dir.join("artifacts");
@@ -231,6 +331,12 @@ impl Store {
                 body TEXT NOT NULL,
                 payload_json TEXT,
                 idempotency_key TEXT,
+                idempotency_fingerprint TEXT,
+                assigned_group TEXT,
+                assigned_to TEXT,
+                task_category TEXT,
+                assigned_role TEXT,
+                not_before_ms INTEGER,
                 accepted_by TEXT,
                 accept_expires_ms INTEGER,
                 closed INTEGER NOT NULL DEFAULT 0
@@ -282,6 +388,7 @@ impl Store {
             ",
         )
         .map_err(|e| format!("failed initializing schema: {e}"))?;
+        ensure_assignment_columns(&conn)?;
 
         let read_pool = Arc::new(ReadPool::new(db_path, 4));
         Ok(Self {
@@ -290,6 +397,7 @@ impl Store {
             artifacts_dir,
             artifact_io_lock: Arc::new(Mutex::new(())),
             cfg,
+            keyring,
         })
     }
 
@@ -422,6 +530,11 @@ impl Store {
         mut req: SendRequest,
     ) -> Result<(SendResponse, Option<u64>), StoreError> {
         let selectors = req.validate().map_err(StoreError::BadRequest)?;
+        let request_fingerprint = req
+            .idempotency_key
+            .as_ref()
+            .map(|_| send_request_fingerprint(&req))
+            .transpose()?;
         let sender_id = AgentId::from_local(host, &req.agent).map_err(StoreError::BadRequest)?;
         let sender_str = sender_id.to_string();
         let now = now_ms();
@@ -429,32 +542,229 @@ impl Store {
             Selector::Group(name) => Some(name.as_str()),
             _ => None,
         });
-        let group_config = requested_group
-            .map(|group_name| {
-                let group = self
-                    .cfg
-                    .groups
-                    .iter()
-                    .find(|group| group.name == group_name)
-                    .ok_or_else(|| {
-                        StoreError::BadRequest(format!("unknown group '{group_name}'"))
-                    })?;
-                if !group.posting_hosts.iter().any(|allowed| allowed == host) {
-                    return Err(StoreError::NotFound(format!(
-                        "group '{group_name}' not found"
-                    )));
-                }
-                Ok(group)
-            })
-            .transpose()?;
-
         let mut db = self
             .conn
             .lock()
             .map_err(|_| StoreError::Internal("db lock poisoned".into()))?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // Message count quota check
+        if let Some(ref idem) = req.idempotency_key {
+            let existing: Option<(
+                i64,
+                String,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                i64,
+                String,
+                String,
+                Option<i64>,
+                String,
+                Option<String>,
+            )> = tx
+                .query_row(
+                    "SELECT seq, msg_id, thread, expires_ms, assigned_group, assigned_to,
+                            task_category, assigned_role, not_before_ms,
+                            idempotency_fingerprint, created_ms, to_json, performative,
+                            reply_to, body, payload_json
+                     FROM messages WHERE sender=?1 AND idempotency_key=?2",
+                    params![&sender_str, idem],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                            r.get(10)?,
+                            r.get(11)?,
+                            r.get(12)?,
+                            r.get(13)?,
+                            r.get(14)?,
+                            r.get(15)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((
+                seq,
+                msg_id,
+                thread,
+                expires_ms,
+                stored_group,
+                stored_assignee,
+                stored_category,
+                stored_role,
+                stored_not_before_ms,
+                stored_fingerprint,
+                created_ms,
+                stored_to_json,
+                stored_performative,
+                stored_reply_to,
+                stored_body,
+                stored_payload_json,
+            )) = existing
+            {
+                if expires_ms <= now {
+                    return Err(StoreError::Conflict(
+                        "idempotency key belongs to an expired retained message".into(),
+                    ));
+                }
+                let legacy_request_matches = || -> Result<bool, StoreError> {
+                    let request_to_json = serde_json::to_string(&req.to)
+                        .map_err(|error| StoreError::Internal(error.to_string()))?;
+                    let request_payload_json = req
+                        .payload
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| StoreError::Internal(error.to_string()))?;
+                    let requested_ttl_ms = req
+                        .expires_in_secs
+                        .map(|secs| (secs as i64).saturating_mul(1000))
+                        .unwrap_or(self.cfg.default_message_ttl_ms);
+                    let expiry_matches = expires_ms.saturating_sub(created_ms) == requested_ttl_ms;
+                    let recipient_matches = if let Some(group) = stored_group.as_deref() {
+                        let group_selector = vec![format!("group:{group}")];
+                        let assigned_recipient = stored_assignee
+                            .as_ref()
+                            .map(|assignee| vec![assignee.clone()])
+                            .map(|recipient| serde_json::to_string(&recipient))
+                            .transpose()
+                            .map_err(|error| StoreError::Internal(error.to_string()))?;
+                        requested_group == Some(group)
+                            && req.to == group_selector
+                            && assigned_recipient.as_deref() == Some(stored_to_json.as_str())
+                            && stored_assignee.is_some()
+                            && stored_role.is_some()
+                            && req.task_category == stored_category
+                            && req.not_before_ms == stored_not_before_ms
+                    } else {
+                        requested_group.is_none()
+                            && stored_assignee.is_none()
+                            && stored_role.is_none()
+                            && req.task_category == stored_category
+                            && req.not_before_ms == stored_not_before_ms
+                            && request_to_json == stored_to_json
+                    };
+                    Ok(stored_fingerprint.is_none()
+                        && req.lease_secs.is_none()
+                        && recipient_matches
+                        && req.performative.as_str() == stored_performative
+                        && req.reply_to.map(|seq| seq as i64) == stored_reply_to
+                        && req.thread.as_ref().is_none_or(|value| value == &thread)
+                        && req.body == stored_body
+                        && request_payload_json == stored_payload_json
+                        && expiry_matches)
+                };
+                if stored_fingerprint
+                    .as_deref()
+                    .is_some_and(|stored| request_fingerprint.as_deref() == Some(stored))
+                    || (stored_fingerprint.is_none() && legacy_request_matches()?)
+                {
+                    touch_sender(&tx, &sender_id, &sender_str, now)?;
+                    tx.commit()?;
+                    return Ok((
+                        SendResponse {
+                            seq: seq as u64,
+                            msg_id,
+                            thread,
+                            duplicate: true,
+                            assigned_to: stored_assignee,
+                            assigned_group: stored_group,
+                            task_category: stored_category,
+                            assigned_role: stored_role,
+                            not_before_ms: stored_not_before_ms,
+                        },
+                        None,
+                    ));
+                }
+                return Err(StoreError::Conflict(
+                    "idempotency key was already used with different request content".into(),
+                ));
+            }
+        }
+
+        let requested_category = req.task_category.as_deref();
+        let group_config = requested_group
+            .map(|group_name| {
+                let (group, enabled_hosts) = match &self.keyring {
+                    Some(keyring) => keyring
+                        .group_policy(group_name)
+                        .map(|(group, hosts)| (Some(group), Some(hosts)))
+                        .unwrap_or((None, None)),
+                    None => (
+                        self.cfg
+                            .groups
+                            .iter()
+                            .find(|group| group.name == group_name)
+                            .cloned(),
+                        None,
+                    ),
+                };
+                let group = group.ok_or_else(|| StoreError::NotFound("group not found".into()))?;
+                let category =
+                    requested_category.expect("group request validation requires task_category");
+                let permission = group.posting_permissions.iter().find(|permission| {
+                    permission.host == host
+                        && permission
+                            .task_categories
+                            .iter()
+                            .any(|allowed| allowed == category)
+                });
+                let Some(permission) = permission else {
+                    return Err(StoreError::NotFound("group not found".into()));
+                };
+                let expires_in_secs = req
+                    .expires_in_secs
+                    .expect("group request validation requires expires_in_secs");
+                if expires_in_secs > permission.max_expires_in_secs {
+                    return Err(StoreError::BadRequest(
+                        "expires_in_secs exceeds the group posting grant".into(),
+                    ));
+                }
+                Ok((group, enabled_hosts, permission.max_schedule_delay_secs))
+            })
+            .transpose()?;
+
+        // Keep sender's last-seen fresh without overwriting registered metadata.
+        touch_sender(&tx, &sender_id, &sender_str, now)?;
+
+        if let Some(not_before_ms) = req.not_before_ms {
+            let max_schedule_delay_secs = group_config
+                .as_ref()
+                .map(|(_, _, max_delay)| *max_delay)
+                .unwrap_or(MAX_EXPIRY_SECS);
+            let ttl_ms = req
+                .expires_in_secs
+                .map(|secs| (secs as i64).saturating_mul(1000))
+                .unwrap_or(self.cfg.default_message_ttl_ms);
+            let expires_ms = now.saturating_add(ttl_ms);
+            let latest_not_before_ms =
+                now.saturating_add((max_schedule_delay_secs as i64).saturating_mul(1000));
+            if not_before_ms <= now
+                || not_before_ms > latest_not_before_ms
+                || not_before_ms >= expires_ms
+            {
+                return Err(StoreError::BadRequest(
+                    "not_before_ms is outside the allowed schedule horizon or message lifetime"
+                        .into(),
+                ));
+            }
+        }
+
+        // Existing idempotent messages remain retryable when the storage quota
+        // has since filled.
         let msg_count: i64 = tx.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
         if msg_count as usize >= self.cfg.max_messages {
             return Err(StoreError::StorageFull(format!(
@@ -463,60 +773,54 @@ impl Store {
             )));
         }
 
-        // Keep sender's last-seen fresh without overwriting registered metadata.
-        tx.execute(
-            "INSERT INTO agents(id, host, harness, session, caps_json, seen_ms, read_position)
-             VALUES(?1, ?2, ?3, ?4, '[]', ?5, 0)
-             ON CONFLICT(id) DO UPDATE SET seen_ms=excluded.seen_ms",
-            params![
-                sender_str,
-                sender_id.host,
-                sender_id.harness,
-                sender_id.session,
-                now
-            ],
-        )?;
-
-        if let Some(ref idem) = req.idempotency_key {
-            let existing: Option<(i64, String, String, i64, String)> = tx
-                .query_row(
-                    "SELECT seq, msg_id, thread, expires_ms, to_json FROM messages WHERE sender=?1 AND idempotency_key=?2",
-                    params![&sender_str, idem],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .optional()?;
-            if let Some((seq, msg_id, thread, expires_ms, to_json)) = existing {
-                if expires_ms > now {
-                    let assigned_to = if requested_group.is_some() {
-                        serde_json::from_str::<Vec<String>>(&to_json)
-                            .ok()
-                            .and_then(|recipients| recipients.into_iter().next())
-                    } else {
-                        None
-                    };
-                    tx.commit()?;
-                    return Ok((
-                        SendResponse {
-                            seq: seq as u64,
-                            msg_id,
-                            thread,
-                            duplicate: true,
-                            assigned_to,
-                        },
-                        None,
-                    ));
-                }
-            }
-        }
-
-        let assigned_to = if let Some(group) = group_config {
+        let (assigned_to, assigned_role) = if let Some((group, enabled_hosts, _)) = group_config {
             let cutoff_ms = now.saturating_sub(self.cfg.agent_ttl_ms);
-            let assignee = crate::assignment::choose(&tx, &group.members, cutoff_ms)?;
+            let category = requested_category.expect("group request validation requires category");
+            let candidates: Vec<String> = group
+                .members
+                .iter()
+                .filter(|member| {
+                    let permitted_role = match req.performative {
+                        Performative::Request => member.role == GroupRole::Specialist,
+                        Performative::RequestVerify => member.role == GroupRole::Reviewer,
+                        _ => false,
+                    };
+                    permitted_role
+                        && member
+                            .responsibilities
+                            .iter()
+                            .any(|responsibility| responsibility == category)
+                        && enabled_hosts.as_ref().is_none_or(|hosts| {
+                            AgentId::parse_full(&member.agent)
+                                .is_ok_and(|agent| hosts.contains(&agent.host))
+                        })
+                })
+                .map(|member| member.agent.clone())
+                .collect();
+            let assignee = crate::assignment::choose(
+                &tx,
+                &group.name,
+                category,
+                &candidates,
+                cutoff_ms,
+                &sender_str,
+            )?;
+            let selected_member = group
+                .members
+                .iter()
+                .find(|member| member.agent == assignee)
+                .ok_or_else(|| StoreError::Internal("selected group member disappeared".into()))?;
             req.to = vec![assignee.clone()];
-            Some(assignee)
+            (
+                Some(assignee),
+                Some(selected_member.role.as_str().to_string()),
+            )
         } else {
-            None
+            (None, None)
         };
+        let assigned_group = requested_group.map(str::to_string);
+        let task_category = req.task_category.clone();
+        let not_before_ms = req.not_before_ms;
 
         let msg_id = new_msg_id(now);
         let thread = if let Some(parent_seq_u64) = req.reply_to {
@@ -531,10 +835,13 @@ impl Store {
                 accept_expires_ms: Option<i64>,
                 closed: i64,
                 expires_ms: i64,
+                assigned_group: Option<String>,
+                assigned_to: Option<String>,
             }
             let parent_row: Option<ParentRow> = tx
                 .query_row(
-                    "SELECT sender, to_json, performative, thread, accepted_by, accept_expires_ms, closed, expires_ms
+                    "SELECT sender, to_json, performative, thread, accepted_by, accept_expires_ms, closed, expires_ms,
+                            assigned_group, assigned_to
                      FROM messages WHERE seq=?1",
                     [parent_seq],
                     |r| {
@@ -547,6 +854,8 @@ impl Store {
                             accept_expires_ms: r.get(5)?,
                             closed: r.get(6)?,
                             expires_ms: r.get(7)?,
+                            assigned_group: r.get(8)?,
+                            assigned_to: r.get(9)?,
                         })
                     },
                 )
@@ -560,6 +869,8 @@ impl Store {
                 accept_expires_ms,
                 closed,
                 expires_ms: parent_expires,
+                assigned_group: parent_assigned_group,
+                assigned_to: parent_assigned_to,
             }) = parent_row
             else {
                 return Err(StoreError::NotFound(format!(
@@ -597,6 +908,20 @@ impl Store {
             }
 
             if parent_perf.is_request() {
+                if parent_assigned_group.is_some()
+                    && matches!(
+                        req.performative,
+                        Performative::Accept
+                            | Performative::Reject
+                            | Performative::Progress
+                            | Performative::Result
+                    )
+                    && parent_assigned_to.as_deref() != Some(sender_str.as_str())
+                {
+                    return Err(StoreError::Conflict(
+                        "group task controls are limited to the persisted assignee".into(),
+                    ));
+                }
                 if closed != 0 {
                     return Err(StoreError::Conflict(format!(
                         "request seq {parent_seq_u64} is already closed"
@@ -707,8 +1032,10 @@ impl Store {
         };
 
         tx.execute(
-            "INSERT INTO messages(msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json, idempotency_key)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO messages(msg_id, created_ms, expires_ms, sender, to_json, performative, thread,
+             reply_to, body, payload_json, idempotency_key, idempotency_fingerprint,
+             assigned_group, assigned_to, task_category, assigned_role, not_before_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 msg_id,
                 now,
@@ -721,6 +1048,12 @@ impl Store {
                 req.body,
                 payload_json,
                 req.idempotency_key,
+                request_fingerprint.as_deref(),
+                assigned_group,
+                assigned_to,
+                task_category,
+                assigned_role,
+                not_before_ms,
             ],
         )?;
         let seq = tx.last_insert_rowid() as u64;
@@ -733,6 +1066,10 @@ impl Store {
                 thread,
                 duplicate: false,
                 assigned_to,
+                assigned_group,
+                task_category,
+                assigned_role,
+                not_before_ms,
             },
             Some(seq),
         ))
@@ -762,9 +1099,10 @@ impl Store {
         let now = now_ms();
 
         let db = self.read_pool.acquire()?;
+        let tx = db.unchecked_transaction()?;
 
         let agent_str = agent_id.to_string();
-        let agent_meta: Option<(Option<String>, String, i64)> = db
+        let agent_meta: Option<(Option<String>, String, i64)> = tx
             .query_row(
                 "SELECT repo, caps_json, read_position FROM agents WHERE id=?1",
                 [&agent_str],
@@ -785,13 +1123,12 @@ impl Store {
         };
 
         let effective_after = after_i64.unwrap_or(read_position as i64);
-        // Establish the cursor boundary before scanning recipient-visible
-        // messages. A concurrent send can appear in the later scan, but the
-        // returned cursor must never advance beyond a message that was not
-        // included in that scan. Such a send will then be returned on the
-        // next request, even when the caller persists `next_after` locally.
+        // Read the boundary and recipient-visible messages from the same
+        // SQLite snapshot. A send committed after this snapshot is established
+        // is deferred to the next request and cannot be skipped by a persisted
+        // `next_after` cursor.
         let seq_head: i64 =
-            db.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |r| {
+            tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |r| {
                 r.get(0)
             })?;
         let seq_head = seq_head.max(0) as u64;
@@ -800,14 +1137,16 @@ impl Store {
         let mut hit_limit = false;
 
         let sql = if thread.is_some() {
-            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json
+            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json,
+                    assigned_group, task_category, assigned_role, not_before_ms
              FROM messages WHERE seq > ?1 AND expires_ms > ?2 AND thread = ?3 ORDER BY seq ASC"
         } else {
-            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json
+            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json,
+                    assigned_group, task_category, assigned_role, not_before_ms
              FROM messages WHERE seq > ?1 AND expires_ms > ?2 ORDER BY seq ASC"
         };
 
-        let mut stmt = db.prepare(sql)?;
+        let mut stmt = tx.prepare(sql)?;
         let mut rows = if let Some(t) = thread {
             stmt.query(params![effective_after, now, t])?
         } else {
@@ -837,17 +1176,20 @@ impl Store {
         drop(rows);
         drop(stmt);
 
+        let last_seq = messages
+            .last()
+            .map_or(effective_after.max(0) as u64, |message| message.seq);
         let next_after = if !hit_limit && thread.is_none() {
-            seq_head.max(effective_after.max(0) as u64)
+            seq_head.max(last_seq).max(effective_after.max(0) as u64)
         } else {
-            messages
-                .last()
-                .map_or(effective_after.max(0) as u64, |m| m.seq)
+            last_seq
         };
 
+        tx.commit()?;
         Ok(InboxResponse {
             notice: UNTRUSTED_NOTICE.to_string(),
             messages,
+            seq_head,
             next_after,
             read_position,
         })
@@ -1175,7 +1517,9 @@ impl Store {
 
         // Query up to 201 messages to detect truncation
         let mut stmt = db.prepare(
-            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json, accepted_by, accept_expires_ms, closed
+            "SELECT seq, msg_id, created_ms, expires_ms, sender, to_json, performative, thread, reply_to, body, payload_json,
+                    assigned_group, task_category, assigned_role, not_before_ms,
+                    accepted_by, accept_expires_ms, closed
              FROM messages WHERE thread=?1 AND expires_ms > ?2 ORDER BY seq ASC LIMIT 201",
         )?;
         let mut rows = stmt.query(params![thread, now])?;
@@ -1188,9 +1532,9 @@ impl Store {
             caller_is_authorized = true;
             let msg = decode_message_row(row)?;
             if msg.performative.is_request() {
-                let ab: Option<String> = row.get(11)?;
-                let ae: Option<i64> = row.get(12)?;
-                closed = row.get::<_, i64>(13)? != 0;
+                let ab: Option<String> = row.get(15)?;
+                let ae: Option<i64> = row.get(16)?;
+                closed = row.get::<_, i64>(17)? != 0;
                 accepted_by = ab.filter(|_| ae.unwrap_or(0) > now || closed);
                 accept_expires_ms = if closed {
                     None
@@ -1583,10 +1927,336 @@ fn decode_message_row(row: &rusqlite::Row<'_>) -> Result<Message, rusqlite::Erro
         expires_ms: row.get(3)?,
         sender: row.get(4)?,
         to,
+        assigned_group: row.get(11)?,
+        task_category: row.get(12)?,
+        assigned_role: row.get(13)?,
+        not_before_ms: row.get(14)?,
         performative,
         thread: row.get(7)?,
         reply_to: reply_to.map(|v| v as u64),
         body: row.get(9)?,
         payload,
     })
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use crate::config::{
+        GroupConfig, GroupMemberConfig, GroupPostingPermission, GroupRole, KeyEntry,
+    };
+
+    #[test]
+    fn adds_group_assignment_columns_to_existing_message_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_id TEXT NOT NULL,
+                to_json TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        ensure_assignment_columns(&conn).unwrap();
+        ensure_assignment_columns(&conn).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .unwrap();
+        assert!(columns.contains("assigned_group"));
+        assert!(columns.contains("assigned_to"));
+        assert!(columns.contains("task_category"));
+        assert!(columns.contains("assigned_role"));
+        assert!(columns.contains("not_before_ms"));
+        assert!(columns.contains("idempotency_fingerprint"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_assignment_category'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn replaces_the_old_assignment_index_with_category_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                assigned_group TEXT,
+                assigned_to TEXT
+            );
+            CREATE INDEX idx_messages_assignment
+                ON messages(assigned_group, assigned_to, seq);",
+        )
+        .unwrap();
+
+        ensure_assignment_columns(&conn).unwrap();
+
+        let old_index_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_assignment'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let new_index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_assignment_category'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_index_count, 0);
+        assert!(new_index_sql.contains("task_category"));
+    }
+
+    #[test]
+    fn group_assignment_skips_a_still_registered_but_revoked_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = GroupConfig {
+            name: "reviewers".into(),
+            members: vec![
+                GroupMemberConfig {
+                    agent: "mac:codex:reviewer".into(),
+                    role: GroupRole::Specialist,
+                    responsibilities: vec!["build-verification".into()],
+                },
+                GroupMemberConfig {
+                    agent: "win:claude:reviewer".into(),
+                    role: GroupRole::Specialist,
+                    responsibilities: vec!["build-verification".into()],
+                },
+            ],
+            posting_permissions: vec![GroupPostingPermission {
+                host: "workstation".into(),
+                task_categories: vec!["build-verification".into()],
+                max_expires_in_secs: 3600,
+                max_schedule_delay_secs: 900,
+            }],
+        };
+        let keyring = crate::auth::KeyRing::from_config(
+            &[
+                KeyEntry {
+                    host: "mac".into(),
+                    sha256: "ab".repeat(32),
+                    enabled: true,
+                },
+                KeyEntry {
+                    host: "win".into(),
+                    sha256: "ef".repeat(32),
+                    enabled: true,
+                },
+                KeyEntry {
+                    host: "workstation".into(),
+                    sha256: "cd".repeat(32),
+                    enabled: true,
+                },
+            ],
+            std::slice::from_ref(&group),
+        )
+        .unwrap();
+        let store_cfg = StoreConfig {
+            groups: vec![group.clone()],
+            ..StoreConfig::default()
+        };
+        let store = Store::open_with_keyring(dir.path(), store_cfg, keyring.clone()).unwrap();
+
+        store
+            .register(
+                "mac",
+                RegisterRequest {
+                    agent: "codex:reviewer".into(),
+                    ..RegisterRequest::default()
+                },
+            )
+            .unwrap();
+        store
+            .register(
+                "win",
+                RegisterRequest {
+                    agent: "claude:reviewer".into(),
+                    ..RegisterRequest::default()
+                },
+            )
+            .unwrap();
+
+        keyring
+            .reload_config(
+                &[
+                    KeyEntry {
+                        host: "mac".into(),
+                        sha256: "ab".repeat(32),
+                        enabled: true,
+                    },
+                    KeyEntry {
+                        host: "win".into(),
+                        sha256: "ef".repeat(32),
+                        enabled: false,
+                    },
+                    KeyEntry {
+                        host: "workstation".into(),
+                        sha256: "cd".repeat(32),
+                        enabled: true,
+                    },
+                ],
+                std::slice::from_ref(&group),
+            )
+            .unwrap();
+
+        let request = SendRequest {
+            agent: "agy:sender".into(),
+            to: vec!["group:reviewers".into()],
+            performative: Performative::Request,
+            thread: None,
+            reply_to: None,
+            body: "Verify the build".into(),
+            payload: None,
+            idempotency_key: Some("stable-assignment".into()),
+            expires_in_secs: Some(1800),
+            lease_secs: None,
+            task_category: Some("build-verification".into()),
+            not_before_ms: Some(now_ms() + 60_000),
+        };
+        let (sent, _) = store.send("workstation", request.clone()).unwrap();
+
+        assert_eq!(sent.assigned_to.as_deref(), Some("mac:codex:reviewer"));
+        assert_eq!(sent.assigned_group.as_deref(), Some("reviewers"));
+        assert_eq!(sent.task_category.as_deref(), Some("build-verification"));
+        assert_eq!(sent.assigned_role.as_deref(), Some("specialist"));
+        assert_eq!(sent.not_before_ms, request.not_before_ms);
+
+        let expired_schedule = now_ms() - 1;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET not_before_ms=?1 WHERE seq=?2",
+                params![expired_schedule, sent.seq],
+            )
+            .unwrap();
+        let retry = store.send("workstation", request).unwrap().0;
+        assert!(retry.duplicate);
+        assert_eq!(retry.assigned_to, sent.assigned_to);
+        assert_eq!(retry.not_before_ms, Some(expired_schedule));
+
+        let mac_inbox = store
+            .inbox("mac", "codex:reviewer", Some(0), None, None, false)
+            .unwrap();
+        let win_inbox = store
+            .inbox("win", "claude:reviewer", Some(0), None, None, false)
+            .unwrap();
+        assert_eq!(mac_inbox.messages.len(), 1);
+        assert_eq!(
+            mac_inbox.messages[0].assigned_group.as_deref(),
+            Some("reviewers")
+        );
+        assert_eq!(
+            mac_inbox.messages[0].task_category.as_deref(),
+            Some("build-verification")
+        );
+        assert_eq!(
+            mac_inbox.messages[0].assigned_role.as_deref(),
+            Some("specialist")
+        );
+        assert!(win_inbox.messages.is_empty());
+    }
+
+    #[test]
+    fn expired_retained_message_reserves_its_idempotency_key_until_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), StoreConfig::default()).unwrap();
+        let request = SendRequest {
+            agent: "agy:sender".into(),
+            to: vec!["mac:codex:reviewer".into()],
+            performative: Performative::Request,
+            thread: None,
+            reply_to: None,
+            body: "Check one commit".into(),
+            payload: None,
+            idempotency_key: Some("expiring-request".into()),
+            expires_in_secs: None,
+            lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
+        };
+        let (sent, _) = store.send("workstation", request.clone()).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET expires_ms=?1 WHERE seq=?2",
+                params![now_ms() - 1, sent.seq],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.send("workstation", request.clone()),
+            Err(StoreError::Conflict(message)) if message.contains("expired retained message")
+        ));
+
+        store.prune_expired().unwrap();
+        let mut reused = request;
+        reused.body = "Check a different commit".into();
+        let (new_message, created_seq) = store.send("workstation", reused).unwrap();
+        assert!(!new_message.duplicate);
+        assert!(created_seq.is_some());
+    }
+
+    #[test]
+    fn migrated_legacy_idempotency_rows_allow_semantic_exact_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), StoreConfig::default()).unwrap();
+        let request = SendRequest {
+            agent: "agy:sender".into(),
+            to: vec!["mac:codex:reviewer".into()],
+            performative: Performative::Request,
+            thread: None,
+            reply_to: None,
+            body: "Check this commit".into(),
+            payload: Some(serde_json::json!({"commit": "abc123"})),
+            idempotency_key: Some("legacy-replay".into()),
+            expires_in_secs: None,
+            lease_secs: None,
+            task_category: Some("build-verification".into()),
+            not_before_ms: Some(now_ms() + 60_000),
+        };
+        let (sent, _) = store.send("workstation", request.clone()).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET idempotency_fingerprint=NULL WHERE seq=?1",
+                [sent.seq],
+            )
+            .unwrap();
+
+        let (retry, _) = store.send("workstation", request.clone()).unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.seq, sent.seq);
+        assert_eq!(retry.thread, sent.thread);
+
+        let mut explicit_default = request.clone();
+        explicit_default.expires_in_secs = Some(7 * 24 * 3600);
+        let (retry_with_explicit_default, _) = store.send("workstation", explicit_default).unwrap();
+        assert!(retry_with_explicit_default.duplicate);
+        assert_eq!(retry_with_explicit_default.seq, sent.seq);
+
+        let mut changed = request;
+        changed.body = "Changed request".into();
+        assert!(matches!(
+            store.send("workstation", changed),
+            Err(StoreError::Conflict(message)) if message.contains("different request content")
+        ));
+    }
 }

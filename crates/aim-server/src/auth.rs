@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::KeyEntry;
+use crate::config::{GroupConfig, GroupMemberConfig, GroupPostingPermission, GroupRole, KeyEntry};
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedHost(pub String);
@@ -31,23 +31,63 @@ struct HashedKey {
 
 #[derive(Clone)]
 pub struct KeyRing {
-    entries: Arc<ArcSwap<Vec<HashedKey>>>,
+    snapshot: Arc<ArcSwap<AuthSnapshot>>,
+}
+
+struct AuthSnapshot {
+    entries: Vec<HashedKey>,
+    groups: Vec<GroupConfig>,
 }
 
 impl KeyRing {
     pub fn from_entries(entries: &[KeyEntry]) -> Result<Self, String> {
-        let parsed = parse_entries(entries)?;
+        Self::from_config(entries, &[])
+    }
+
+    pub fn from_config(entries: &[KeyEntry], groups: &[GroupConfig]) -> Result<Self, String> {
+        let parsed = AuthSnapshot {
+            entries: parse_entries(entries)?,
+            groups: groups.to_vec(),
+        };
         Ok(Self {
-            entries: Arc::new(ArcSwap::from_pointee(parsed)),
+            snapshot: Arc::new(ArcSwap::from_pointee(parsed)),
         })
     }
 
     /// Hot-reload keys from a new config. Returns the number of enabled keys.
     pub fn reload(&self, entries: &[KeyEntry]) -> Result<usize, String> {
-        let parsed = parse_entries(entries)?;
-        let count = parsed.len();
-        self.entries.store(Arc::new(parsed));
+        let groups = self.snapshot.load().groups.clone();
+        self.reload_config(entries, &groups)
+    }
+
+    /// Atomically reload keys and group policy from one validated server config.
+    pub fn reload_config(
+        &self,
+        entries: &[KeyEntry],
+        groups: &[GroupConfig],
+    ) -> Result<usize, String> {
+        let parsed = AuthSnapshot {
+            entries: parse_entries(entries)?,
+            groups: groups.to_vec(),
+        };
+        let count = parsed.entries.len();
+        self.snapshot.store(Arc::new(parsed));
         Ok(count)
+    }
+
+    pub fn group_policy(&self, name: &str) -> Option<(GroupConfig, HashSet<String>)> {
+        let snapshot = self.snapshot.load();
+        let group = snapshot
+            .groups
+            .iter()
+            .find(|group| group.name == name)?
+            .clone();
+        let enabled_hosts = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.host.clone())
+            .collect();
+        Some((group, enabled_hosts))
     }
 
     /// Constant-time lookup across every enabled key hash. Returns the host
@@ -61,8 +101,8 @@ impl KeyRing {
             return None;
         }
         let candidate: [u8; 32] = Sha256::digest(bytes).into();
-        let guard = self.entries.load();
-        let entries = &**guard;
+        let guard = self.snapshot.load();
+        let entries = &guard.entries;
         let mut matched_idx: usize = 0;
         let mut found: u8 = 0;
         for (idx, entry) in entries.iter().enumerate() {
@@ -365,6 +405,66 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(ring.authenticate(&tok_a), None);
         assert_eq!(ring.authenticate(&tok_b).as_deref(), Some("host-b"));
+    }
+
+    #[test]
+    fn reload_config_switches_keys_and_group_membership_together() {
+        let tok_a = generate_token();
+        let tok_b = generate_token();
+        let first_group = GroupConfig {
+            name: "reviewers".into(),
+            members: vec![GroupMemberConfig {
+                agent: "host-a:codex:reviewer".into(),
+                role: GroupRole::Reviewer,
+                responsibilities: vec!["platform-verification".into()],
+            }],
+            posting_permissions: vec![GroupPostingPermission {
+                host: "host-a".into(),
+                task_categories: vec!["platform-verification".into()],
+                max_expires_in_secs: 3600,
+                max_schedule_delay_secs: 0,
+            }],
+        };
+        let ring = KeyRing::from_config(
+            &[KeyEntry {
+                host: "host-a".into(),
+                sha256: hash_token_hex(&tok_a),
+                enabled: true,
+            }],
+            &[first_group],
+        )
+        .unwrap();
+
+        let second_group = GroupConfig {
+            name: "reviewers".into(),
+            members: vec![GroupMemberConfig {
+                agent: "host-b:codex:reviewer".into(),
+                role: GroupRole::Reviewer,
+                responsibilities: vec!["platform-verification".into()],
+            }],
+            posting_permissions: vec![GroupPostingPermission {
+                host: "host-b".into(),
+                task_categories: vec!["platform-verification".into()],
+                max_expires_in_secs: 3600,
+                max_schedule_delay_secs: 0,
+            }],
+        };
+        ring.reload_config(
+            &[KeyEntry {
+                host: "host-b".into(),
+                sha256: hash_token_hex(&tok_b),
+                enabled: true,
+            }],
+            &[second_group],
+        )
+        .unwrap();
+
+        assert_eq!(ring.authenticate(&tok_a), None);
+        assert_eq!(ring.authenticate(&tok_b).as_deref(), Some("host-b"));
+        let (group, enabled_hosts) = ring.group_policy("reviewers").unwrap();
+        assert!(!enabled_hosts.contains("host-a"));
+        assert!(enabled_hosts.contains("host-b"));
+        assert_eq!(group.members[0].agent, "host-b:codex:reviewer");
     }
 
     #[test]

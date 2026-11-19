@@ -420,6 +420,8 @@ fn execute_tool(
                 idempotency_key: opt_str(args, "idempotency_key")?,
                 expires_in_secs: opt_u64(args, "expires_in_secs")?,
                 lease_secs: opt_u64(args, "lease_secs")?,
+                task_category: opt_str(args, "task_category")?,
+                not_before_ms: opt_i64(args, "not_before_ms")?,
             };
             let res = client.send(&req)?;
             Ok((None, serde_json::to_value(res).map_err(|e| e.to_string())?))
@@ -539,12 +541,12 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "aim_send",
-            "description": "Send a typed message to agents on any computer via AIM. Performatives enforce reply rules (never reply to RESULT; never ACK ANNOUNCE). Secrets are automatically blocked.",
+            "description": "Send a typed message to agents on any computer via AIM. A group request requires task_category and expires_in_secs, may include not_before_ms, and is routed to one active specialist for REQUEST or reviewer for REQUEST_VERIFY whose responsibilities include the category. The hub enforces the posting host's category and time grants. An exact-recipient root REQUEST or REQUEST_VERIFY may also declare task_category and not_before_ms for the recipient's local wake policy. Group sends return the persisted assignee and category. Performatives enforce reply rules. Secrets are automatically blocked.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "agent": { "type": "string", "description": "Sender HARNESS:SESSION. Optional when env/config provides it." },
-                    "to": { "type": "array", "items": { "type": "string" }, "description": "Selectors: *, host:NAME, harness:NAME, repo:NAME, cap:NAME, SESSION, or HOST:HARNESS:SESSION" },
+                    "to": { "type": "array", "items": { "type": "string" }, "description": "Selectors: *, host:NAME, harness:NAME, repo:NAME, cap:NAME, group:NAME, SESSION, or HOST:HARNESS:SESSION. group:NAME requires a root REQUEST or REQUEST_VERIFY and routes to one authorized, active worker." },
                     "performative": { "type": "string", "enum": perf_enum },
                     "message": { "type": "string" },
                     "reply_to": { "type": "integer", "description": "Parent seq when answering a message (required for REPLY, ACCEPT, REJECT, PROGRESS, RESULT)" },
@@ -552,7 +554,9 @@ fn tool_definitions() -> Vec<Value> {
                     "payload": { "type": "object" },
                     "idempotency_key": { "type": "string" },
                     "expires_in_secs": { "type": "integer" },
-                    "lease_secs": { "type": "integer", "description": "Lease duration for ACCEPT or PROGRESS" }
+                    "lease_secs": { "type": "integer", "description": "Lease duration for ACCEPT or PROGRESS" },
+                    "task_category": { "type": "string", "description": "Required for group requests and must match both the posting grant and an eligible member responsibility. Optional on an exact-recipient root REQUEST or REQUEST_VERIFY for local recipient policy." },
+                    "not_before_ms": { "type": "integer", "description": "Optional earliest wake timestamp in Unix milliseconds. Group scheduling is bounded by the posting grant and message expiry. Direct scheduling is bounded by message expiry, with recipient-side policy required." }
                 },
                 "required": ["to", "message"],
                 "additionalProperties": false
@@ -560,7 +564,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "aim_inbox",
-            "description": "Read AIM messages addressed to this agent across computers. Uses hub-stored read_position if after is omitted. Supports wait_secs (up to 30s) for reactive long-polling.",
+            "description": "Read AIM messages addressed to this agent across computers. Uses hub-stored read_position if after is omitted. Returns seq_head from the same SQLite snapshot as messages and next_after for bounded bootstrap and pagination. Supports wait_secs (up to 30s) for reactive long-polling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

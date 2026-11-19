@@ -10,7 +10,9 @@ use aim_proto::wire::{AckRequest, ClaimRequest, RegisterRequest, ReleaseRequest,
 use aim_proto::{Performative, PROTOCOL};
 use aim_server::auth::{generate_token, hash_token_hex};
 use aim_server::certs::{init_ca, init_server_cert};
-use aim_server::config::{GroupConfig, KeyEntry, ServerConfig};
+use aim_server::config::{
+    GroupConfig, GroupMemberConfig, GroupPostingPermission, GroupRole, KeyEntry, ServerConfig,
+};
 use aim_server::serve_with_handle;
 use axum_server::Handle;
 use tempfile::TempDir;
@@ -114,10 +116,23 @@ async fn start_harness() -> Harness {
     cfg.groups = vec![GroupConfig {
         name: "reviewers".into(),
         members: vec![
-            "macbook:codex:reviewer".into(),
-            "win-dev:claude:reviewer".into(),
+            GroupMemberConfig {
+                agent: "macbook:codex:reviewer".into(),
+                role: GroupRole::Reviewer,
+                responsibilities: vec!["platform-verification".into()],
+            },
+            GroupMemberConfig {
+                agent: "win-dev:claude:specialist".into(),
+                role: GroupRole::Specialist,
+                responsibilities: vec!["platform-verification".into()],
+            },
         ],
-        posting_hosts: vec!["workstation".into()],
+        posting_permissions: vec![GroupPostingPermission {
+            host: "workstation".into(),
+            task_categories: vec!["platform-verification".into()],
+            max_expires_in_secs: 7200,
+            max_schedule_delay_secs: 3600,
+        }],
     }];
 
     let handle = Handle::new();
@@ -152,7 +167,7 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
 
     for (client, agent) in [
         (mac.clone(), "codex:reviewer"),
-        (win.clone(), "claude:reviewer"),
+        (win.clone(), "claude:specialist"),
     ] {
         tokio::task::spawn_blocking(move || {
             client.register(&RegisterRequest {
@@ -174,8 +189,10 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
         body: "Verify the cross-platform build".into(),
         payload: None,
         idempotency_key: Some("group-request-1".into()),
-        expires_in_secs: None,
+        expires_in_secs: Some(1800),
         lease_secs: None,
+        task_category: Some("platform-verification".into()),
+        not_before_ms: Some(aim_server::store::now_ms() + 30_000),
     };
     let sent = tokio::task::spawn_blocking({
         let client = wks.clone();
@@ -186,6 +203,21 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
     .unwrap()
     .unwrap();
     assert_eq!(sent.assigned_to.as_deref(), Some("macbook:codex:reviewer"));
+    assert_eq!(sent.assigned_group.as_deref(), Some("reviewers"));
+    assert_eq!(sent.task_category.as_deref(), Some("platform-verification"));
+    assert_eq!(sent.assigned_role.as_deref(), Some("reviewer"));
+    assert_eq!(sent.not_before_ms, req.not_before_ms);
+
+    let mut changed_category = req.clone();
+    changed_category.task_category = Some("security-review".into());
+    let conflict = tokio::task::spawn_blocking({
+        let wks = wks.clone();
+        move || wks.send(&changed_category)
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(conflict.contains("409"));
 
     let retry = tokio::task::spawn_blocking({
         let client = wks.clone();
@@ -197,6 +229,8 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
     assert!(retry.duplicate);
     assert_eq!(retry.seq, sent.seq);
     assert_eq!(retry.assigned_to, sent.assigned_to);
+    assert_eq!(retry.task_category, sent.task_category);
+    assert_eq!(retry.not_before_ms, sent.not_before_ms);
 
     let mac_inbox = tokio::task::spawn_blocking({
         let client = mac.clone();
@@ -207,14 +241,132 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
     .unwrap();
     let win_inbox = tokio::task::spawn_blocking({
         let client = win.clone();
-        move || client.inbox("claude:reviewer", Some(0), Some(0), None, None, false)
+        move || client.inbox("claude:specialist", Some(0), Some(0), None, None, false)
     })
     .await
     .unwrap()
     .unwrap();
     assert_eq!(mac_inbox.messages.len(), 1);
     assert_eq!(mac_inbox.messages[0].seq, sent.seq);
+    assert_eq!(mac_inbox.messages[0].not_before_ms, sent.not_before_ms);
+    assert_eq!(
+        mac_inbox.messages[0].task_category.as_deref(),
+        Some("platform-verification")
+    );
     assert!(win_inbox.messages.is_empty());
+
+    let lease_request = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::RequestVerify,
+                thread: None,
+                reply_to: None,
+                body: "Verify the release candidate".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(1800),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let lease_seq = lease_request.seq;
+
+    let requester_accept = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["macbook:codex:reviewer".into()],
+                performative: Performative::Accept,
+                thread: None,
+                reply_to: Some(lease_seq),
+                body: "The requester cannot accept this assignment".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: Some(300),
+                task_category: None,
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(requester_accept.contains("409"));
+
+    let assigned_accept = tokio::task::spawn_blocking({
+        let client = mac.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "codex:reviewer".into(),
+                to: vec!["workstation:agy:sender".into()],
+                performative: Performative::Accept,
+                thread: None,
+                reply_to: Some(lease_seq),
+                body: "The assigned reviewer accepts".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: None,
+                lease_secs: Some(300),
+                task_category: None,
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!assigned_accept.duplicate);
+
+    let work_request = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::Request,
+                thread: None,
+                reply_to: None,
+                body: "Run the platform verification".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(1800),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        work_request.assigned_to.as_deref(),
+        Some("win-dev:claude:specialist")
+    );
+    assert_eq!(work_request.assigned_role.as_deref(), Some("specialist"));
+    let specialist_inbox = tokio::task::spawn_blocking({
+        let client = win.clone();
+        move || client.inbox("claude:specialist", Some(0), Some(0), None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(specialist_inbox.messages.len(), 1);
+    assert_eq!(specialist_inbox.messages[0].seq, work_request.seq);
+    assert_eq!(
+        specialist_inbox.messages[0].assigned_role.as_deref(),
+        Some("specialist")
+    );
 
     let forbidden = SendRequest {
         agent: "agy:sender".into(),
@@ -225,8 +377,10 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
         body: "An alert to a group".into(),
         payload: None,
         idempotency_key: None,
-        expires_in_secs: None,
+        expires_in_secs: Some(1800),
         lease_secs: None,
+        task_category: Some("platform-verification".into()),
+        not_before_ms: None,
     };
     assert!(forbidden
         .validate()
@@ -245,14 +399,275 @@ async fn group_request_is_assigned_to_one_active_member_and_retry_keeps_assignme
                 body: "Unauthorized group post".into(),
                 payload: None,
                 idempotency_key: None,
-                expires_in_secs: None,
+                expires_in_secs: Some(1800),
                 lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: None,
             })
         }
     })
     .await
     .unwrap();
-    assert!(unauthorized.unwrap_err().contains("404"));
+    let unauthorized_error = unauthorized.unwrap_err();
+    assert!(unauthorized_error.contains("404"));
+
+    let unknown_group = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:missing".into()],
+                performative: Performative::Request,
+                thread: None,
+                reply_to: None,
+                body: "Unknown group post".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(1800),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(unknown_group, unauthorized_error);
+
+    let unauthorized_category = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::RequestVerify,
+                thread: None,
+                reply_to: None,
+                body: "Request outside the host grant".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(1800),
+                lease_secs: None,
+                task_category: Some("incident-response".into()),
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(unauthorized_category, unknown_group);
+
+    let excessive_expiry = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::RequestVerify,
+                thread: None,
+                reply_to: None,
+                body: "Request exceeds its expiry grant".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(7201),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: None,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(excessive_expiry.contains("400"));
+
+    let outside_schedule_grant = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::RequestVerify,
+                thread: None,
+                reply_to: None,
+                body: "Request exceeds its schedule grant".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(7200),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: Some(aim_server::store::now_ms() + 3_601_000),
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(outside_schedule_grant.contains("400"));
+
+    let after_expiry = tokio::task::spawn_blocking({
+        let client = wks.clone();
+        move || {
+            client.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::RequestVerify,
+                thread: None,
+                reply_to: None,
+                body: "Request is scheduled after expiry".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(1800),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: Some(aim_server::store::now_ms() + 1_801_000),
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(after_expiry.contains("400"));
+}
+
+#[tokio::test]
+async fn categorized_direct_request_preserves_optional_schedule_for_recipient_policy() {
+    let h = start_harness().await;
+    let mac = h.client_for(&h.mac_key);
+    let wks = h.client_for(&h.wks_key);
+    tokio::task::spawn_blocking({
+        let mac = mac.clone();
+        move || {
+            mac.register(&RegisterRequest {
+                agent: "codex:reviewer".into(),
+                ..RegisterRequest::default()
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let request = SendRequest {
+        agent: "agy:sender".into(),
+        to: vec!["macbook:codex:reviewer".into()],
+        performative: Performative::Request,
+        thread: None,
+        reply_to: None,
+        body: "Verify the macOS build".into(),
+        payload: None,
+        idempotency_key: Some("direct-categorized-request-1".into()),
+        expires_in_secs: Some(1800),
+        lease_secs: None,
+        task_category: Some("platform-verification".into()),
+        not_before_ms: Some(aim_server::store::now_ms() + 30_000),
+    };
+    let sent = tokio::task::spawn_blocking({
+        let wks = wks.clone();
+        let request = request.clone();
+        move || wks.send(&request)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(sent.assigned_group, None);
+    assert_eq!(sent.task_category.as_deref(), Some("platform-verification"));
+    assert_eq!(sent.not_before_ms, request.not_before_ms);
+
+    let mut changed_requests = Vec::new();
+    let mut changed = request.clone();
+    changed.to = vec!["win-dev:claude:specialist".into()];
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.performative = Performative::RequestVerify;
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.thread = Some("different-thread".into());
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.reply_to = Some(1);
+    changed.task_category = None;
+    changed.not_before_ms = None;
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.body = "Changed body".into();
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.payload = Some(serde_json::json!({"changed": true}));
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.expires_in_secs = Some(1801);
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.task_category = Some("security-review".into());
+    changed_requests.push(changed);
+    let mut changed = request.clone();
+    changed.not_before_ms = Some(aim_server::store::now_ms() + 45_000);
+    changed_requests.push(changed);
+
+    for changed in changed_requests {
+        let conflict = tokio::task::spawn_blocking({
+            let wks = wks.clone();
+            move || wks.send(&changed)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(conflict.contains("409"), "{conflict}");
+    }
+
+    let retry = tokio::task::spawn_blocking({
+        let wks = wks.clone();
+        let request = request.clone();
+        move || wks.send(&request)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(retry.task_category, sent.task_category);
+    assert_eq!(retry.not_before_ms, sent.not_before_ms);
+
+    let inbox = tokio::task::spawn_blocking({
+        let mac = mac.clone();
+        move || mac.inbox("codex:reviewer", Some(0), Some(0), None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+    assert!(inbox.seq_head >= sent.seq);
+    assert_eq!(
+        inbox.messages[0].task_category.as_deref(),
+        Some("platform-verification")
+    );
+    assert_eq!(inbox.messages[0].not_before_ms, sent.not_before_ms);
+
+    let after_expiry = tokio::task::spawn_blocking({
+        let wks = wks.clone();
+        move || {
+            wks.send(&SendRequest {
+                agent: "agy:sender".into(),
+                to: vec!["macbook:codex:reviewer".into()],
+                performative: Performative::Request,
+                thread: None,
+                reply_to: None,
+                body: "Reject a schedule after expiry".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(10),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: Some(aim_server::store::now_ms() + 11_000),
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(after_expiry.contains("400"));
 }
 
 #[tokio::test]
@@ -417,6 +832,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
         idempotency_key: Some("step-verify-1".into()),
         expires_in_secs: None,
         lease_secs: None,
+        task_category: None,
+        not_before_ms: None,
     };
     let sent1 = tokio::task::spawn_blocking({
         let c = wks.clone();
@@ -466,6 +883,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -507,6 +926,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -530,6 +951,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -558,6 +981,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
     assert_eq!(mac_inbox.messages.len(), 1);
     assert_eq!(mac_inbox.messages[0].seq, sent1.seq);
     assert_eq!(mac_inbox.read_position, 0);
+    assert!(mac_inbox.seq_head >= sent1.seq);
+    assert_eq!(mac_inbox.next_after, mac_inbox.seq_head);
 
     // A separate listener can keep its own cursor without consuming the
     // interactive inbox. Only explicit ACK advances the hub read position.
@@ -569,7 +994,9 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
     .unwrap()
     .unwrap();
     assert_eq!(wake_inbox.messages.len(), 1);
+    assert!(wake_inbox.next_after >= wake_inbox.messages[0].seq);
     assert_eq!(wake_inbox.next_after, mac_inbox.next_after);
+    assert_eq!(wake_inbox.seq_head, mac_inbox.seq_head);
     assert_eq!(wake_inbox.read_position, 0);
 
     let still_unread = tokio::task::spawn_blocking({
@@ -624,6 +1051,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: Some(300),
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -647,6 +1076,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -683,6 +1114,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -715,6 +1148,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })
@@ -738,6 +1173,8 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
                 idempotency_key: None,
                 expires_in_secs: None,
                 lease_secs: None,
+                task_category: None,
+                not_before_ms: None,
             })
         }
     })

@@ -42,7 +42,10 @@ Copy `/etc/aim/ca.crt` and that computer's `/etc/aim/client-keys/<host>.key` to 
 ### 3. Connect `claude`, `codex`, and `agy` via MCP or CLI
 
 - **MCP server**: run `aim mcp` (stdio JSON-RPC 2.0 exposing `aim_register`, `aim_send`, `aim_inbox`, `aim_ack`, `aim_claim`, `aim_release`, `aim_status`, `aim_thread`).
+- `aim_inbox` returns `seq_head` from the same database snapshot as `messages` and `next_after`, so a listener can bound its initial scan without moving the interactive `read_position`.
 - **CLI examples**:
+
+The server can configure named groups with member roles and responsibility categories, plus per-host category, expiry, and schedule grants. A root `REQUEST` or `REQUEST_VERIFY` sent to `group:NAME` must specify `--task-category` and `--expires`. The hub assigns one active eligible member, and `aim_send` returns the persisted assignee and role. An exact-recipient root request may optionally include `--task-category` for local wake policy. An uncategorized direct request stays readable but is not an automatic wake. A categorized direct request may include `--not-before-ms`, which the recipient must cap with its own schedule opt-in. Group schedule delay is bounded by the posting grant.
 
 ```sh
 # Register this agent session
@@ -57,6 +60,14 @@ aim --agent agy:session1 send \
   --performative REQUEST_VERIFY \
   --attach ./verify.log \
   --message "Verify settings row on commit c0ffee12"
+
+# Ask one active member of a server-configured group to verify work
+aim --agent agy:session1 send \
+  --to group:mac-reviewers \
+  --performative REQUEST_VERIFY \
+  --task-category platform-verification \
+  --expires 1800 \
+  --message "Verify the macOS build for commit c0ffee12"
 
 # Wait up to 25s for a reply without polling spam, then advance hub read_position
 aim --agent agy:session1 inbox --wait 25 --ack
