@@ -439,6 +439,29 @@ async fn cross_host_protocol_tls_auth_leases_claims_and_artifacts() {
     assert_eq!(mac_inbox.messages[0].seq, sent1.seq);
     assert_eq!(mac_inbox.read_position, 0);
 
+    // A separate listener can keep its own cursor without consuming the
+    // interactive inbox. Only explicit ACK advances the hub read position.
+    let wake_inbox = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || c.inbox("codex:m1", Some(0), Some(0), None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(wake_inbox.messages.len(), 1);
+    assert_eq!(wake_inbox.next_after, mac_inbox.next_after);
+    assert_eq!(wake_inbox.read_position, 0);
+
+    let still_unread = tokio::task::spawn_blocking({
+        let c = mac.clone();
+        move || c.inbox("codex:m1", None, Some(0), None, None, false)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(still_unread.messages.len(), 1);
+    assert_eq!(still_unread.read_position, 0);
+
     // Ack advances hub-stored read_position; next inbox without `after` returns empty.
     let acked = tokio::task::spawn_blocking({
         let c = mac.clone();

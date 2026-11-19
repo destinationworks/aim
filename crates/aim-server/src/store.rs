@@ -742,6 +742,11 @@ impl Store {
         };
 
         let effective_after = after_i64.unwrap_or(read_position as i64);
+        // Establish the cursor boundary before scanning recipient-visible
+        // messages. A concurrent send can appear in the later scan, but the
+        // returned cursor must never advance beyond a message that was not
+        // included in that scan. Such a send will then be returned on the
+        // next request, even when the caller persists `next_after` locally.
         let seq_head: i64 =
             db.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |r| {
                 r.get(0)

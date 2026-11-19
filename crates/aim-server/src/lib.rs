@@ -1,3 +1,4 @@
+pub(crate) mod assignment;
 pub mod auth;
 pub mod certs;
 pub mod config;

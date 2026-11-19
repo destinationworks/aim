@@ -252,7 +252,8 @@ pub struct Message {
 pub struct InboxResponse {
     pub notice: String,
     pub messages: Vec<Message>,
-    /// Pass as `after` to continue from here.
+    /// Pass as `after` to continue this reader's scan. Reading with an
+    /// explicit `after` does not advance the agent's interactive read position.
     pub next_after: u64,
     /// The read position stored on the hub for this agent.
     pub read_position: u64,
