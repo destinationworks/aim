@@ -2242,6 +2242,7 @@ max_schedule_delay_secs = 60
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
+        let deliver_at_ms = now_epoch_ms + 3_000;
         wks.send(&SendRequest {
             agent: "codex:lead".into(),
             to: vec!["macbook:claude:claude-worker".into()],
@@ -2254,7 +2255,7 @@ max_schedule_delay_secs = 60
             expires_in_secs: Some(300),
             lease_secs: None,
             task_category: Some("platform-verification".into()),
-            not_before_ms: Some(now_epoch_ms + 350),
+            not_before_ms: Some(deliver_at_ms),
         })
         .unwrap();
 
@@ -2294,7 +2295,14 @@ max_schedule_delay_secs = 60
         assert_eq!(run3_json["dispatched"], 0, "run3={run3_json}");
 
         // Wait past not_before_ms and run 4: dispatches the deferred Claude spawn.
-        std::thread::sleep(Duration::from_millis(450));
+        let current_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let wait_ms = (deliver_at_ms + 150).saturating_sub(current_epoch_ms);
+        if wait_ms > 0 {
+            std::thread::sleep(Duration::from_millis(wait_ms as u64));
+        }
         let run4 = Command::new(&aim_bin)
             .args(["wake", "--once", "--policy"])
             .arg(&policy_path)
