@@ -281,12 +281,21 @@ pub fn run(client: &AimClient, args: &WakeArgs, pretty: bool) -> Result<i32, Str
     }
 
     if let Some(parent) = state_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        aim_fs::ensure_private_dir(parent).map_err(|e| {
-            format!(
-                "cannot create wake state directory {}: {e}",
-                parent.display()
-            )
-        })?;
+        if !parent.exists() {
+            aim_fs::ensure_private_dir(parent).map_err(|e| {
+                format!(
+                    "cannot create wake state directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        } else {
+            aim_fs::verify_dir_not_writable_by_others(parent).map_err(|e| {
+                format!(
+                    "wake state directory {} is not safely protected ({e})",
+                    parent.display()
+                )
+            })?;
+        }
     }
     let lock_path = lock_path_for_state(&state_path);
     let _lock_guard = aim_fs::lock_file_exclusive(&lock_path).map_err(|e| {
