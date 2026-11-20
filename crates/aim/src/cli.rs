@@ -19,6 +19,7 @@ use crate::config::{
     registration_git_context, ConfigFile, Overrides, ResolvedConfig,
 };
 use crate::mcp;
+use crate::wake::{self, WakeArgs};
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +93,8 @@ pub enum Command {
     },
     /// Run a stdio MCP server exposing AIM tools to agy, codex, and claude
     Mcp,
+    /// Wake existing agy/claude sessions or auto-spawn new ones from trusted AIM requests
+    Wake(WakeArgs),
 }
 
 #[derive(Args)]
@@ -332,6 +335,12 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         return Ok(0);
     }
 
+    if let Command::Wake(ref args) = cli.command {
+        if args.status {
+            return wake::run_status(args, pretty);
+        }
+    }
+
     let cfg = ResolvedConfig::load(&overrides)?;
     if matches!(cli.command, Command::Mcp) {
         return mcp::run(&cfg);
@@ -342,6 +351,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
 
     match cli.command {
         Command::Init(_) | Command::Health | Command::Version(_) | Command::Mcp => unreachable!(),
+        Command::Wake(args) => return wake::run(&client, &args, pretty),
         Command::Register(args) => {
             let agent = cfg.resolve_agent(agent_arg)?;
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());

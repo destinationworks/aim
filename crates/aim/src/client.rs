@@ -179,6 +179,18 @@ impl AimClient {
     }
 
     pub fn inbox_multi(&self, req: &MultiInboxRequest) -> Result<MultiInboxResponse, String> {
+        match self.inbox_multi_if_supported(req)? {
+            Some(res) => Ok(res),
+            None => Err("AIM hub does not support /v1/inbox/multi".into()),
+        }
+    }
+
+    /// Queries `POST /v1/inbox/multi`, returning `Ok(None)` when the hub reports
+    /// `404`, `405`, or `501` so callers can fall back cleanly to `/v1/inbox`.
+    pub fn inbox_multi_if_supported(
+        &self,
+        req: &MultiInboxRequest,
+    ) -> Result<Option<MultiInboxResponse>, String> {
         req.validate()?;
         let url = self.endpoint("/v1/inbox/multi")?;
         let call_timeout = req
@@ -196,7 +208,10 @@ impl AimClient {
             .build()
             .send_json(req)
             .map_err(|e| format!("HTTPS multi-inbox request failed: {e}"))?;
-        parse_json_response(resp)
+        if matches!(resp.status().as_u16(), 404 | 405 | 501) {
+            return Ok(None);
+        }
+        parse_json_response(resp).map(Some)
     }
 
     pub fn ack(&self, req: &AckRequest) -> Result<AckResponse, String> {

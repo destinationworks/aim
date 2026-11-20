@@ -51,6 +51,31 @@ impl Harness {
 }
 
 async fn start_harness() -> Harness {
+    start_harness_with_groups(vec![GroupConfig {
+        name: "reviewers".into(),
+        members: vec![
+            GroupMemberConfig {
+                agent: "macbook:codex:reviewer".into(),
+                role: GroupRole::Reviewer,
+                responsibilities: vec!["platform-verification".into()],
+            },
+            GroupMemberConfig {
+                agent: "win-dev:claude:specialist".into(),
+                role: GroupRole::Specialist,
+                responsibilities: vec!["platform-verification".into()],
+            },
+        ],
+        posting_permissions: vec![GroupPostingPermission {
+            host: "workstation".into(),
+            task_categories: vec!["platform-verification".into()],
+            max_expires_in_secs: 7200,
+            max_schedule_delay_secs: 3600,
+        }],
+    }])
+    .await
+}
+
+async fn start_harness_with_groups(groups: Vec<GroupConfig>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
@@ -113,27 +138,7 @@ async fn start_harness() -> Harness {
             enabled: false,
         },
     ];
-    cfg.groups = vec![GroupConfig {
-        name: "reviewers".into(),
-        members: vec![
-            GroupMemberConfig {
-                agent: "macbook:codex:reviewer".into(),
-                role: GroupRole::Reviewer,
-                responsibilities: vec!["platform-verification".into()],
-            },
-            GroupMemberConfig {
-                agent: "win-dev:claude:specialist".into(),
-                role: GroupRole::Specialist,
-                responsibilities: vec!["platform-verification".into()],
-            },
-        ],
-        posting_permissions: vec![GroupPostingPermission {
-            host: "workstation".into(),
-            task_categories: vec!["platform-verification".into()],
-            max_expires_in_secs: 7200,
-            max_schedule_delay_secs: 3600,
-        }],
-    }];
+    cfg.groups = groups;
 
     let handle = Handle::new();
     let srv_handle = handle.clone();
@@ -1991,6 +1996,361 @@ async fn version_cli_http_and_mcp_work_end_to_end() {
                 .unwrap();
         assert_eq!(ver_no_hub["client"]["git_sha"], aim_proto::GIT_SHA);
         assert!(ver_no_hub.get("hub").is_none());
+    })
+    .await
+    .unwrap();
+}
+
+fn compile_mock_cli(dir: &Path) -> PathBuf {
+    let src = dir.join("mock_cli.rs");
+    let bin = dir.join(if cfg!(windows) {
+        "mock_cli.exe"
+    } else {
+        "mock_cli"
+    });
+    let code = r#"
+use std::fs::OpenOptions;
+use std::io::Write;
+fn main() {
+    let log = std::env::var("AIM_WAKE_MOCK_LOG").expect("AIM_WAKE_MOCK_LOG");
+    let cwd = std::env::current_dir().unwrap().display().to_string();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let escaped: Vec<String> = args
+        .iter()
+        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")))
+        .collect();
+    let line = format!("{{\"cwd\":\"{}\",\"args\":[{}]}}\n", cwd.replace('\\', "\\\\").replace('"', "\\\""), escaped.join(","));
+    let mut f = OpenOptions::new().create(true).append(true).open(log).unwrap();
+    f.write_all(line.as_bytes()).unwrap();
+    println!("mock-dispatched");
+}
+"#;
+    std::fs::write(&src, code).unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let status = Command::new(rustc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("failed invoking rustc for mock_cli");
+    assert!(status.success(), "rustc failed compiling mock_cli");
+    bin
+}
+
+#[tokio::test]
+async fn aim_wake_e2e_handles_session_wake_group_spawn_schedule_and_fail_closed() {
+    let h = start_harness_with_groups(vec![GroupConfig {
+        name: "reviewers".into(),
+        members: vec![GroupMemberConfig {
+            agent: "macbook:agy:spawner-review".into(),
+            role: GroupRole::Reviewer,
+            responsibilities: vec!["platform-verification".into()],
+        }],
+        posting_permissions: vec![GroupPostingPermission {
+            host: "workstation".into(),
+            task_categories: vec!["platform-verification".into()],
+            max_expires_in_secs: 7200,
+            max_schedule_delay_secs: 3600,
+        }],
+    }])
+    .await;
+
+    let aim_bin = aim_binary();
+    let wks = h.client_for(&h.wks_key);
+    let win = h.client_for(&h.win_key);
+    let base_url = h.base_url.clone();
+    let ca_cert = h.ca_cert.clone();
+    let mac_key = h.mac_key.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let mock_bin = compile_mock_cli(root);
+        let log_file = root.join("dispatches.jsonl");
+        let work_dir = root.join("workspace");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let policy_path = root.join("wake.toml");
+        let state_path = root.join("wake-state.json");
+
+        // 1. Missing policy fails closed on `--once`, while `--status` reports enabled=false.
+        let status_out = Command::new(&aim_bin)
+            .args(["wake", "--status", "--policy"])
+            .arg(&policy_path)
+            .arg("--state")
+            .arg(&state_path)
+            .output()
+            .unwrap();
+        assert!(status_out.status.success());
+        let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+        assert_eq!(status_json["enabled"], false);
+        assert_eq!(status_json["policy_exists"], false);
+
+        let disabled_once = Command::new(&aim_bin)
+            .args(["wake", "--once", "--policy"])
+            .arg(&policy_path)
+            .arg("--state")
+            .arg(&state_path)
+            .env("AIM_URL", base_url.as_str())
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &mac_key)
+            .output()
+            .unwrap();
+        assert!(!disabled_once.status.success());
+
+        // 2. Write a valid private policy enabling an agy session, agy group spawner, and claude spawner.
+        let policy_toml = format!(
+            r#"
+enabled = true
+agentapi_bin = {bin:?}
+claude_bin = {bin:?}
+
+[sessions.main_agy]
+enabled = true
+harness = "agy"
+backend = "agentapi"
+target_id = "00381b16-2659-4624-8191-56990711bdaf"
+cwd = {cwd:?}
+trusted_sender_hosts = ["workstation"]
+allowed_performatives = ["QUERY", "REQUEST"]
+
+[spawners.spawner-review]
+enabled = true
+harness = "agy"
+backend = "agentapi"
+cwd = {cwd:?}
+model = "pro"
+trusted_sender_hosts = ["workstation"]
+allowed_performatives = ["REQUEST_VERIFY"]
+allowed_groups = ["reviewers"]
+allowed_task_categories = ["platform-verification"]
+max_concurrent = 2
+
+[spawners.claude-worker]
+enabled = true
+harness = "claude"
+backend = "claude_cli"
+cwd = {cwd:?}
+model = "claude-sonnet-4-5"
+trusted_sender_hosts = ["workstation"]
+allowed_performatives = ["REQUEST"]
+require_group = false
+max_schedule_delay_secs = 60
+"#,
+            bin = mock_bin.to_string_lossy(),
+            cwd = work_dir.to_string_lossy()
+        );
+        aim_fs::write_private_atomic(&policy_path, policy_toml.as_bytes(), true).unwrap();
+
+        // Send a historical message BEFORE the first wake run; bootstrap must skip it.
+        wks.send(&SendRequest {
+            agent: "codex:lead".into(),
+            to: vec!["macbook:agy:main_agy".into()],
+            performative: Performative::Query,
+            thread: None,
+            reply_to: None,
+            body: "old message before bootstrap".into(),
+            payload: None,
+            idempotency_key: None,
+            expires_in_secs: Some(300),
+            lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
+        })
+        .unwrap();
+
+        // Run 1: registers all 3 targets on hub and sets initial seq_head baseline.
+        let run1 = Command::new(&aim_bin)
+            .args(["wake", "--once", "--policy"])
+            .arg(&policy_path)
+            .arg("--state")
+            .arg(&state_path)
+            .env("AIM_URL", base_url.as_str())
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &mac_key)
+            .env("AIM_WAKE_MOCK_LOG", &log_file)
+            .output()
+            .unwrap();
+        assert!(
+            run1.status.success(),
+            "run1 stderr: {}",
+            String::from_utf8_lossy(&run1.stderr)
+        );
+        let run1_json: serde_json::Value = serde_json::from_slice(&run1.stdout).unwrap();
+        assert_eq!(run1_json["registered"], 3);
+        assert_eq!(run1_json["dispatched"], 0);
+        assert!(!log_file.exists());
+
+        // Now send 4 new messages after bootstrap:
+        // A) Trusted QUERY to session main_agy -> wakes via agentapi send-message.
+        // B) Trusted REQUEST_VERIFY to group:reviewers -> routed to agy:spawner-review -> spawns agentapi new-conversation.
+        // C) Untrusted host win-dev QUERY to main_agy -> skipped!
+        // D) Future scheduled REQUEST to claude:claude-worker (+400ms) -> deferred on run2, spawned on run4!
+        wks.send(&SendRequest {
+            agent: "codex:lead".into(),
+            to: vec!["macbook:agy:main_agy".into()],
+            performative: Performative::Query,
+            thread: None,
+            reply_to: None,
+            body: "Live question from workstation".into(),
+            payload: None,
+            idempotency_key: None,
+            expires_in_secs: Some(300),
+            lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
+        })
+        .unwrap();
+
+        let grp = wks
+            .send(&SendRequest {
+                agent: "codex:lead".into(),
+                to: vec!["group:reviewers".into()],
+                performative: Performative::RequestVerify,
+                thread: None,
+                reply_to: None,
+                body: "Verify PR #207 on mac/linux".into(),
+                payload: None,
+                idempotency_key: None,
+                expires_in_secs: Some(300),
+                lease_secs: None,
+                task_category: Some("platform-verification".into()),
+                not_before_ms: None,
+            })
+            .unwrap();
+        assert_eq!(
+            grp.assigned_to.as_deref(),
+            Some("macbook:agy:spawner-review")
+        );
+
+        win.send(&SendRequest {
+            agent: "codex:stranger".into(),
+            to: vec!["macbook:agy:main_agy".into()],
+            performative: Performative::Query,
+            thread: None,
+            reply_to: None,
+            body: "Untrusted host message".into(),
+            payload: None,
+            idempotency_key: None,
+            expires_in_secs: Some(300),
+            lease_secs: None,
+            task_category: None,
+            not_before_ms: None,
+        })
+        .unwrap();
+
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let deliver_at_ms = now_epoch_ms + 3_000;
+        wks.send(&SendRequest {
+            agent: "codex:lead".into(),
+            to: vec!["macbook:claude:claude-worker".into()],
+            performative: Performative::Request,
+            thread: None,
+            reply_to: None,
+            body: "Deferred Claude task".into(),
+            payload: None,
+            idempotency_key: None,
+            expires_in_secs: Some(300),
+            lease_secs: None,
+            task_category: Some("platform-verification".into()),
+            not_before_ms: Some(deliver_at_ms),
+        })
+        .unwrap();
+
+        // Run 2: delivers A & B, skips C, defers D.
+        let run2 = Command::new(&aim_bin)
+            .args(["wake", "--once", "--policy"])
+            .arg(&policy_path)
+            .arg("--state")
+            .arg(&state_path)
+            .env("AIM_URL", base_url.as_str())
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &mac_key)
+            .env("AIM_WAKE_MOCK_LOG", &log_file)
+            .output()
+            .unwrap();
+        assert!(run2.status.success());
+        let run2_json: serde_json::Value = serde_json::from_slice(&run2.stdout).unwrap();
+        assert_eq!(run2_json["dispatched"], 2, "run2={run2_json}");
+        assert_eq!(run2_json["succeeded"], 2);
+        assert_eq!(run2_json["skipped"], 1);
+        assert_eq!(run2_json["deferred"], 1);
+
+        // Run 3 immediately: idempotent, 0 new dispatches.
+        let run3 = Command::new(&aim_bin)
+            .args(["wake", "--once", "--policy"])
+            .arg(&policy_path)
+            .arg("--state")
+            .arg(&state_path)
+            .env("AIM_URL", base_url.as_str())
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &mac_key)
+            .env("AIM_WAKE_MOCK_LOG", &log_file)
+            .output()
+            .unwrap();
+        assert!(run3.status.success());
+        let run3_json: serde_json::Value = serde_json::from_slice(&run3.stdout).unwrap();
+        assert_eq!(run3_json["dispatched"], 0, "run3={run3_json}");
+
+        // Wait past not_before_ms and run 4: dispatches the deferred Claude spawn.
+        let current_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let wait_ms = (deliver_at_ms + 150).saturating_sub(current_epoch_ms);
+        if wait_ms > 0 {
+            std::thread::sleep(Duration::from_millis(wait_ms as u64));
+        }
+        let run4 = Command::new(&aim_bin)
+            .args(["wake", "--once", "--policy"])
+            .arg(&policy_path)
+            .arg("--state")
+            .arg(&state_path)
+            .env("AIM_URL", base_url.as_str())
+            .env("AIM_CA_CERT", &ca_cert)
+            .env("AIM_KEY_FILE", &mac_key)
+            .env("AIM_WAKE_MOCK_LOG", &log_file)
+            .output()
+            .unwrap();
+        assert!(run4.status.success());
+        let run4_json: serde_json::Value = serde_json::from_slice(&run4.stdout).unwrap();
+        assert_eq!(run4_json["dispatched"], 1, "run4={run4_json}");
+        assert_eq!(run4_json["succeeded"], 1);
+
+        let raw_log = std::fs::read_to_string(&log_file).unwrap();
+        let entries: Vec<serde_json::Value> = raw_log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 3, "entries={entries:?}");
+
+        assert!(entries.iter().any(|e| {
+            let args = e["args"].as_array().unwrap();
+            args[0] == "send-message"
+                && args[2] == "00381b16-2659-4624-8191-56990711bdaf"
+                && args[3]
+                    .as_str()
+                    .unwrap()
+                    .contains("Live question from workstation")
+        }));
+        assert!(entries.iter().any(|e| {
+            let args = e["args"].as_array().unwrap();
+            args[0] == "new-conversation"
+                && args[1] == "--model=pro"
+                && args[3]
+                    .as_str()
+                    .unwrap()
+                    .contains("Verify PR #207 on mac/linux")
+        }));
+        assert!(entries.iter().any(|e| {
+            let args = e["args"].as_array().unwrap();
+            args[0] == "-p"
+                && args[1] == "--model"
+                && args[2] == "claude-sonnet-4-5"
+                && args[3].as_str().unwrap().contains("Deferred Claude task")
+        }));
     })
     .await
     .unwrap();
